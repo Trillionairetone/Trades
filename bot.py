@@ -6,7 +6,12 @@ Settings are read from environment variables (no code editing needed):
   OANDA_TOKEN       (required) your API token
   OANDA_ACCOUNT_ID  (required) e.g. 101-001-1234567-001
 Optional:
-  UNITS             fixed trade size in units (default 1000 = 0.01 lot)
+  UNITS             fallback size in units if risk-based sizing fails (default 1000)
+  RISK_PCT          % of balance risked per trade (default 0.5)
+  MAX_UNITS         hard cap on trade size (default 50000)
+  MAX_PER_CURRENCY  max net same-direction trades per currency (default 2)
+  MAX_RISK_ATR      skip if stop is wider than this many ATRs (default 2.5)
+  MAX_SPREAD_FRAC   skip if spread is more than this share of the risk (default 0.2)
   MAX_POSITIONS     max open trades at once (default 5)
   PAIRS             comma list (default major pairs)
 """
@@ -17,8 +22,8 @@ import datetime as dt
 import requests
 
 BASE = "https://api-fxpractice.oanda.com"  # PRACTICE ONLY
-TOKEN = os.environ.get("OANDA_TOKEN")
-ACCOUNT = os.environ.get("OANDA_ACCOUNT_ID")
+TOKEN = "".join(os.environ.get("OANDA_TOKEN", "").split())
+ACCOUNT = "".join(os.environ.get("OANDA_ACCOUNT_ID", "").split())
 UNITS = int(os.environ.get("UNITS", "1000"))
 MAX_POSITIONS = int(os.environ.get("MAX_POSITIONS", "5"))
 PAIRS = os.environ.get(
@@ -26,6 +31,11 @@ PAIRS = os.environ.get(
     "EUR_USD,GBP_USD,USD_JPY,AUD_USD,USD_CAD,USD_CHF,NZD_USD,EUR_JPY,GBP_JPY",
 ).split(",")
 RR = 3.0
+RISK_PCT = float(os.environ.get("RISK_PCT", "0.5"))
+MAX_UNITS = int(os.environ.get("MAX_UNITS", "50000"))
+MAX_PER_CURRENCY = int(os.environ.get("MAX_PER_CURRENCY", "2"))
+MAX_RISK_ATR = float(os.environ.get("MAX_RISK_ATR", "2.5"))
+MAX_SPREAD_FRAC = float(os.environ.get("MAX_SPREAD_FRAC", "0.2"))
 
 if not TOKEN or not ACCOUNT:
     sys.exit("Missing OANDA_TOKEN or OANDA_ACCOUNT_ID environment variables.")
@@ -157,9 +167,67 @@ def open_trades():
     return api("GET", f"/v3/accounts/{ACCOUNT}/openTrades")["trades"]
 
 
-def place(sig):
+def account_info():
+    a = api("GET", f"/v3/accounts/{ACCOUNT}/summary")["account"]
+    return float(a["balance"]), a["currency"]
+
+
+def live_price(pair):
+    """Current bid/ask plus the rate to convert quote-currency losses to account currency."""
+    d = api("GET", f"/v3/accounts/{ACCOUNT}/pricing",
+            params={"instruments": pair, "includeHomeConversions": "true"})
+    p = d["prices"][0]
+    if p.get("tradeable") is False:
+        raise RuntimeError("market not tradeable right now")
+    bid = float(p["bids"][0]["price"])
+    ask = float(p["asks"][0]["price"])
+    quote = pair.split("_")[1]
+    conv = None
+    for h in d.get("homeConversions", []):
+        if h["currency"] == quote:
+            conv = float(h["accountLoss"])
+    return bid, ask, quote, conv
+
+
+def size_units(risk_price, quote, conv):
+    """Units so that hitting the stop loses about RISK_PCT% of the balance."""
+    balance, acct_ccy = account_info()
+    if conv is None:
+        if quote != acct_ccy:
+            raise RuntimeError(f"no conversion rate {quote}->{acct_ccy}")
+        conv = 1.0
+    units = int((balance * RISK_PCT / 100) / (risk_price * conv))
+    return max(0, min(units, MAX_UNITS))
+
+
+def exposure(trades):
+    """Net same-direction count per currency (long EUR_USD = +1 EUR, -1 USD)."""
+    ex = {}
+    for t in trades:
+        base, quote = t["instrument"].split("_")
+        d = 1 if float(t["currentUnits"]) > 0 else -1
+        ex[base] = ex.get(base, 0) + d
+        ex[quote] = ex.get(quote, 0) - d
+    return ex
+
+
+def exposure_ok(ex, pair, signal):
+    base, quote = pair.split("_")
+    d = 1 if signal == "BUY" else -1
+    return (abs(ex.get(base, 0) + d) <= MAX_PER_CURRENCY
+            and abs(ex.get(quote, 0) - d) <= MAX_PER_CURRENCY)
+
+
+def add_exposure(ex, pair, signal):
+    base, quote = pair.split("_")
+    d = 1 if signal == "BUY" else -1
+    ex[base] = ex.get(base, 0) + d
+    ex[quote] = ex.get(quote, 0) - d
+
+
+def place(sig, units):
     pair = sig["pair"]
-    units = UNITS if sig["signal"] == "BUY" else -UNITS
+    units = units if sig["signal"] == "BUY" else -units
     body = {"order": {
         "type": "MARKET", "instrument": pair, "units": str(units),
         "timeInForce": "FOK", "positionFill": "DEFAULT",
@@ -167,15 +235,53 @@ def place(sig):
         "takeProfitOnFill": {"price": fmt(pair, sig["tp"])},
     }}
     r = api("POST", f"/v3/accounts/{ACCOUNT}/orders", json=body)
-    print(f"  -> order sent: {list(r.keys())}", flush=True)
+    if "orderFillTransaction" in r:
+        print(f"  -> FILLED {units} units @ {r['orderFillTransaction'].get('price')}", flush=True)
+        return True
+    why = (r.get("orderCancelTransaction") or r.get("orderRejectTransaction") or {}).get(
+        "reason", list(r.keys()))
+    print(f"  -> NOT filled: {why}", flush=True)
+    return False
+
+
+def execute(s):
+    """Re-price on live bid/ask, check stop and spread, size by risk, place the order."""
+    pair = s["pair"]
+    bid, ask, quote, conv = live_price(pair)
+    buy = s["signal"] == "BUY"
+    entry = ask if buy else bid
+    risk = (entry - s["sl"]) if buy else (s["sl"] - entry)
+    if risk <= 0:
+        print("  skipped: price already beyond the stop", flush=True)
+        return False
+    if risk > MAX_RISK_ATR * s["atr"]:
+        print(f"  skipped: stop too wide ({risk / s['atr']:.1f} ATR)", flush=True)
+        return False
+    if (ask - bid) > MAX_SPREAD_FRAC * risk:
+        print(f"  skipped: spread too wide ({(ask - bid) / risk:.0%} of risk)", flush=True)
+        return False
+    s["entry"] = entry
+    s["tp"] = entry + RR * risk if buy else entry - RR * risk
+    try:
+        units = size_units(risk, quote, conv)
+    except Exception as e:
+        units = UNITS
+        print(f"  sizing failed ({e}); using fixed {UNITS} units", flush=True)
+    if units < 1:
+        print("  skipped: risk-based size rounds to 0 units", flush=True)
+        return False
+    print(f"  re-priced: ENTRY {fmt(pair, entry)} SL {fmt(pair, s['sl'])} "
+          f"TP {fmt(pair, s['tp'])} | {units} units", flush=True)
+    return place(s, units)
 
 
 def cycle():
-    now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     print(f"\n=== Scan {now} ===", flush=True)
     trades = open_trades()
     busy = {t["instrument"] for t in trades}
     count = len(trades)
+    ex = exposure(trades)
     for pair in PAIRS:
         try:
             s = analyse(pair)
@@ -192,10 +298,12 @@ def cycle():
                     print("  skipped: already have a trade on this pair")
                 elif count >= MAX_POSITIONS:
                     print("  skipped: max positions reached")
-                else:
-                    place(s)
+                elif not exposure_ok(ex, pair, s["signal"]):
+                    print("  skipped: too much exposure to one currency")
+                elif execute(s):
                     busy.add(pair)
                     count += 1
+                    add_exposure(ex, pair, s["signal"])
         except Exception as e:
             print(f"{pair} error: {e}", flush=True)
 
