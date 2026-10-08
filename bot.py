@@ -12,6 +12,7 @@ Optional:
   MAX_PER_CURRENCY  max net same-direction trades per currency (default 2)
   MAX_RISK_ATR      skip if stop is wider than this many ATRs (default 2.5)
   MAX_SPREAD_FRAC   skip if spread is more than this share of the risk (default 0.2)
+  VOL_FACTOR        candle volume must beat this share of the 20-candle average (default 0.8)
   MAX_POSITIONS     max open trades at once (default 5)
   PAIRS             comma list (default major pairs)
 """
@@ -36,6 +37,7 @@ MAX_UNITS = int(os.environ.get("MAX_UNITS", "50000"))
 MAX_PER_CURRENCY = int(os.environ.get("MAX_PER_CURRENCY", "2"))
 MAX_RISK_ATR = float(os.environ.get("MAX_RISK_ATR", "2.5"))
 MAX_SPREAD_FRAC = float(os.environ.get("MAX_SPREAD_FRAC", "0.2"))
+VOL_FACTOR = float(os.environ.get("VOL_FACTOR", "0.8"))
 
 if not TOKEN or not ACCOUNT:
     sys.exit("Missing OANDA_TOKEN or OANDA_ACCOUNT_ID environment variables.")
@@ -133,30 +135,47 @@ def analyse(pair):
         trend = "Sideways"
 
     lower, mid, upper = bollinger(closes)
-    vol_ok = last["v"] > sma([c["v"] for c in m15[-21:-1]], 20)
+    vol_ok = last["v"] > VOL_FACTOR * sma([c["v"] for c in m15[-21:-1]], 20)
     zone = 1.0 * a  # "near" a level
 
     signal = "NO TRADE"
     sl = tp = None
-    if trend == "Bullish" and vol_ok and bullish_candle(prev, last):
+    blocked = []  # which filters stopped this pair (for the log)
+    if trend == "Sideways":
+        blocked.append("trend")
+    elif trend == "Bullish":
         near_sup = any(abs(last["l"] - s) <= zone or last["l"] < s for s in supports)
         touched = min(last["l"], prev["l"]) <= lower * 1.0 + 0.2 * a
-        if (near_sup or touched) and price > lower:
+        level_ok = (near_sup or touched) and price > lower
+        if not vol_ok:
+            blocked.append("volume")
+        if not bullish_candle(prev, last):
+            blocked.append("candle")
+        if not level_ok:
+            blocked.append("level/BB")
+        if not blocked:
             sl = min(last["l"], prev["l"]) - 0.3 * a
             risk = price - sl
             if risk > 0:
                 signal, tp = "BUY", price + RR * risk
-    elif trend == "Bearish" and vol_ok and bearish_candle(prev, last):
+    else:  # Bearish
         near_res = any(abs(last["h"] - r) <= zone or last["h"] > r for r in resists)
         touched = max(last["h"], prev["h"]) >= upper - 0.2 * a
-        if (near_res or touched) and price < upper:
+        level_ok = (near_res or touched) and price < upper
+        if not vol_ok:
+            blocked.append("volume")
+        if not bearish_candle(prev, last):
+            blocked.append("candle")
+        if not level_ok:
+            blocked.append("level/BB")
+        if not blocked:
             sl = max(last["h"], prev["h"]) + 0.3 * a
             risk = sl - price
             if risk > 0:
                 signal, tp = "SELL", price - RR * risk
 
     return {"pair": pair, "trend": trend, "signal": signal, "entry": price,
-            "sl": sl, "tp": tp, "atr": a}
+            "sl": sl, "tp": tp, "atr": a, "blocked": blocked}
 
 
 def fmt(pair, x):
@@ -288,6 +307,8 @@ def cycle():
             if not s:
                 continue
             line = f"{pair} | {s['trend']} | {s['signal']}"
+            if s["signal"] == "NO TRADE" and s["blocked"]:
+                line += " | blocked: " + ", ".join(s["blocked"])
             if s["signal"] != "NO TRADE":
                 risk = abs(s["entry"] - s["sl"])
                 line += (f" | ENTRY {fmt(pair, s['entry'])} SL {fmt(pair, s['sl'])}"
