@@ -9,6 +9,7 @@ Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
          BACKTEST_STRATEGY=srbb backtests your original bot instead (daily S/R + Bollinger bounce)
          BACKTEST_STRATEGY=flux backtests the two Flux Charts scripts (ICT Power Of Three, Volumized Order Blocks)
          BACKTEST_STRATEGY=po3s backtests the session Power Of Three (Asian range -> London fake move -> fade)
+         BACKTEST_STRATEGY=po3c backtests Power Of Three + LuxAlgo Reversal Signals + Flux Consolidation Zones
 Live   : EXIT_MODE=fixed (stop + 1:3 target, default) or EXIT_MODE=flip (stop only, the bot closes the
          trade itself when UT Bot signals the other way; only trades the bot opened are managed)
 Exits  : backtest compares "flip" (exit when UT Bot signals the other way) with "sr" (same, plus a take-profit
@@ -1215,6 +1216,158 @@ def run_backtest_po3s(api, days):
 
 
 # ----------------------------------------------------------------------------
+# BACKTEST: Power Of Three combined with two more scripts (rules fixed before testing)
+#   TD   = LuxAlgo Reversal Signals "momentum phase": 9 closes in a row below (or above) the close 4 candles back
+#          (DeMark's TD Sequential setup). Only fade the fake move once the move shows this exhaustion count:
+#          a completed 9 in the fake move's direction within 4 candles either side of it, else skip the setup.
+#   Zone = Flux Consolidation Zones (candle mode): 4+ candles in a row with small bodies and a range under ATR(4).
+#          Only trade if the accumulation actually contained such a tight zone.
+#   Exits, pairs and everything else are unchanged from the Flux Power Of Three (stop 5 x ATR, target 0.86R).
+# ----------------------------------------------------------------------------
+PO3C_TD_WINDOW = _i("PO3C_TD_WINDOW", 4)
+PO3C_ZONE_MIN = _i("PO3C_ZONE_MIN", 4)
+
+
+def td_counts(c):
+    """LuxAlgo momentum-phase counters: buy count (close < close 4 back) and sell count, each resetting after 9."""
+    n = len(c)
+    bsc = np.zeros(n, dtype=int)
+    ssc = np.zeros(n, dtype=int)
+    b = s = 0
+    for i in range(4, n):
+        if c[i] < c[i - 4]:
+            b = 1 if b == 9 else b + 1
+            s = 0
+        else:
+            s = 1 if s == 9 else s + 1
+            b = 0
+        bsc[i], ssc[i] = b, s
+    return bsc, ssc
+
+
+def consolidation_runs(d):
+    """Flux 'Candles' consolidation: length of the current run of small-body candles with range under ATR(4)."""
+    o, h, l, c = (d[k].to_numpy() for k in ("o", "h", "l", "c"))
+    atr4 = calc_atr(d, 4).to_numpy()
+    tight = (np.abs(c - o) < (h - l) * 0.5) & ((h - l) < atr4)
+    runs = np.zeros(len(d), dtype=int)
+    r = 0
+    for i in range(len(d)):
+        r = r + 1 if tight[i] else 0
+        runs[i] = r
+    return runs
+
+
+def simulate_po3_combo(d, pair, start_ts, use_td, use_zone):
+    acc_len, acc_mult, manip_mult = PO3_PRESETS.get(PO3_MODE, PO3_PRESETS["small"])
+    t = d["time"].tolist()
+    h, l, c = d["h"].to_numpy(), d["l"].to_numpy(), d["c"].to_numpy()
+    bo, bh, bl, bc = (d[k].to_numpy() for k in ("bo", "bh", "bl", "bc"))
+    ao, ah, al, ac = (d[k].to_numpy() for k in ("ao", "ah", "al", "ac"))
+    atr = calc_atr(d, 50).to_numpy()
+    hh = d["h"].rolling(acc_len).max().to_numpy()
+    ll = d["l"].rolling(acc_len).min().to_numpy()
+    bsc, ssc = td_counts(c)
+    runs = consolidation_runs(d)
+    n = len(d)
+    trades, rejected = [], {"td": 0, "zone": 0}
+    state, i = 0, 0
+    acc_top = acc_bot = None
+    acc_end = acc_start = 0
+    W = PO3C_TD_WINDOW
+    while i < n - 1:
+        a = atr[i]
+        if np.isnan(hh[i]) or np.isnan(a):
+            i += 1
+            continue
+        if state == 0 and hh[i] - ll[i] <= acc_mult * a:
+            state, acc_end, acc_start = 1, i, max(0, i - acc_len + 1)
+            acc_top, acc_bot = hh[i] + 0.5 * a, ll[i] - 0.5 * a
+        if state == 1:
+            if h[i] > acc_top or l[i] < acc_bot:
+                state = 2
+            else:
+                acc_end = i
+        direction = 0
+        if state == 2 and i > acc_end:
+            if h[i] > acc_top + manip_mult * a:
+                direction = -1
+            elif l[i] < acc_bot - manip_mult * a:
+                direction = 1
+        if direction == 0:
+            i += 1
+            continue
+        state = 0
+        if use_zone and runs[acc_start:i + 1].max() < PO3C_ZONE_MIN:
+            rejected["zone"] += 1
+            i += 1
+            continue
+        signal_bar = i
+        if use_td:
+            # fading a drop needs a completed BUY count (9 closes lower); fading a spike needs a SELL count
+            count = bsc if direction == 1 else ssc
+            found = None
+            for m in range(max(0, i - W), min(i + W, n - 2) + 1):
+                if count[m] == 9:
+                    found = m
+                    break
+            if found is None:
+                rejected["td"] += 1
+                i += W + 1          # we would have waited W candles for it
+                continue
+            signal_bar = max(i, found)
+        j = signal_bar + 1
+        entry = ao[j] if direction == 1 else bo[j]
+        risk = PO3_SL_ATR * atr[signal_bar]
+        sl, tp = entry - direction * risk, entry + direction * PO3_RR * risk
+        r, k = _fixed_exit(direction, j, entry, sl, tp, PO3_RR, risk, bh, bl, bc, ah, al, ac, n)
+        if t[j] >= start_ts:
+            trades.append({"pair": pair, "entry": t[j], "exit": t[k], "dir": direction, "r": float(r),
+                           "risk_pips": risk / pip(pair), "spread_frac": (ao[j] - bo[j]) / risk})
+        i = k + 1
+    return trades, rejected
+
+
+def run_backtest_po3c(api, days):
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+    start_ts = pd.Timestamp(start)
+    log.info(f"BACKTEST | Power Of Three + Reversal Signals (TD 9) + Consolidation Zones | {TIMEFRAME} | "
+             f"last {days} days | pairs {PO3S_PAIRS}")
+    rows = {"Flux ref": [], "+TD": [], "+Zone": [], "All 3": []}
+    rej = {"td": 0, "zone": 0}
+    for pair in PO3S_PAIRS:
+        try:
+            sig = fetch_range(api, pair, TIMEFRAME, start - timedelta(days=10))
+            if len(sig) < 300:
+                log.info(f"{pair} | not enough history, skipped")
+                continue
+            rows["Flux ref"] += simulate_po3(sig, pair, start_ts)
+            tr, _ = simulate_po3_combo(sig, pair, start_ts, use_td=True, use_zone=False)
+            rows["+TD"] += tr
+            tr, _ = simulate_po3_combo(sig, pair, start_ts, use_td=False, use_zone=True)
+            rows["+Zone"] += tr
+            tr, rj = simulate_po3_combo(sig, pair, start_ts, use_td=True, use_zone=True)
+            rows["All 3"] += tr
+            for k2 in rej:
+                rej[k2] += rj[k2]
+            log.info(f"{pair} | done | All 3: {len(tr)} trades")
+        except Exception as e:
+            log.error(f"{pair} | BACKTEST ERROR | {e}")
+
+    log.info("")
+    log.info(f"===== PO3 COMBO | {TIMEFRAME} | last {days} days | results in R =====")
+    log.info(f"{'':<8}{'n':>5}{'win':>6}{'avgR':>6}{'PF':>5}{'1st':>6}{'2nd':>6}")
+    for label, tr in rows.items():
+        log.info(_summary_line(label, tr))
+    log.info("Flux ref = plain Power Of Three. +TD / +Zone = one filter each. All 3 = both filters (the main candidate).")
+    log.info(f"All 3 skipped setups: no TD exhaustion {rej['td']}, no tight zone {rej['zone']}.")
+    log.info(f"Targets {PO3_RR:g}R per 1R risked, so it needs {100 / (1 + PO3_RR):.0f}%+ wins to break even.")
+    log.info("Need: avgR above 0 in BOTH halves, PF above 1.2, a few hundred trades.")
+    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+
+
+# ----------------------------------------------------------------------------
 # LIVE
 # ----------------------------------------------------------------------------
 def place_order(api, pair, direction, sl, tp=None):
@@ -1372,6 +1525,8 @@ def main():
             run_backtest_flux(api, days)
         elif strategy == "po3s":
             run_backtest_po3s(api, days)
+        elif strategy == "po3c":
+            run_backtest_po3c(api, days)
         else:
             run_backtest(api, days)
         while True:  # idle so Railway does not keep re-running it
