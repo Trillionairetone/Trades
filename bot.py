@@ -10,6 +10,7 @@ Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
          BACKTEST_STRATEGY=flux backtests the two Flux Charts scripts (ICT Power Of Three, Volumized Order Blocks)
          BACKTEST_STRATEGY=po3s backtests the session Power Of Three (Asian range -> London fake move -> fade)
          BACKTEST_STRATEGY=po3c backtests Power Of Three + LuxAlgo Reversal Signals + Flux Consolidation Zones
+         BACKTEST_STRATEGY=po3e backtests Power Of Three + LuxAlgo Echo Forecast
 Live   : EXIT_MODE=fixed (stop + 1:3 target, default) or EXIT_MODE=flip (stop only, the bot closes the
          trade itself when UT Bot signals the other way; only trades the bot opened are managed)
 Exits  : backtest compares "flip" (exit when UT Bot signals the other way) with "sr" (same, plus a take-profit
@@ -1368,6 +1369,168 @@ def run_backtest_po3c(api, days):
 
 
 # ----------------------------------------------------------------------------
+# BACKTEST: Power Of Three + LuxAlgo Echo Forecast + EMA break of structure (rules fixed before testing)
+#   Echo = the script's forecast, recomputed at the signal candle from past prices only: find the older
+#          49-candle window most correlated with the latest 49 closes, and use the direction it projects.
+#          Only take the fade if the forecast points the same way.
+#   BOS  = after the fake move, wait up to 20 candles for a close back through the latest swing point
+#          (a 3-candle swing high for buys, swing low for sells) that is also beyond the 50 EMA; enter then.
+#   Exits and pairs are unchanged from the Flux Power Of Three (stop 5 x ATR, target 0.86R, 3 tight-spread pairs).
+# ----------------------------------------------------------------------------
+ECHO_LEN = _i("ECHO_LEN", 50)        # evaluation window
+ECHO_FCAST = _i("ECHO_FCAST", 50)    # forecast window
+PO3E_EMA = _i("PO3E_EMA", 50)
+PO3E_BOS_WINDOW = _i("PO3E_BOS_WINDOW", 20)
+PO3E_SWING = _i("PO3E_SWING", 3)
+
+
+def echo_direction(c, i):
+    """Echo Forecast [LuxAlgo] at candle i ('Similarity' + 'Cumulative'): +1 up, -1 down, 0 unknown."""
+    L, F = ECHO_LEN, ECHO_FCAST
+    need = 2 * F + L
+    if i < need:
+        return 0
+    A = c[i - need:i + 1][::-1]          # A[0] = current close, A[j] = close j candles ago
+    a = A[0:F - 1]
+    best_r, k = None, 0
+    if np.std(a) == 0:
+        return 0
+    for j in range(L):
+        b = A[F + j:2 * F + j - 1]
+        if np.std(b) == 0:
+            continue
+        r = float(np.corrcoef(a, b)[0, 1])
+        if best_r is None or r >= best_r:
+            best_r, k = r, j
+    move = A[F + k] - A[2 * F + k]       # the forecast path adds up these price changes
+    return 1 if move > 0 else (-1 if move < 0 else 0)
+
+
+def last_swings(h, l, s):
+    """Price of the most recent confirmed swing high / low known at each candle (needs s candles each side)."""
+    n = len(h)
+    sh = np.full(n, np.nan)
+    sl = np.full(n, np.nan)
+    cur_h = cur_l = np.nan
+    for i in range(n):
+        p = i - s                         # candidate swing, confirmed now
+        if p - s >= 0:
+            if h[p] > h[p - s:p].max() and h[p] > h[p + 1:i + 1].max():
+                cur_h = h[p]
+            if l[p] < l[p - s:p].min() and l[p] < l[p + 1:i + 1].min():
+                cur_l = l[p]
+        sh[i], sl[i] = cur_h, cur_l
+    return sh, sl
+
+
+def simulate_po3_echo(d, pair, start_ts, use_echo, use_bos):
+    acc_len, acc_mult, manip_mult = PO3_PRESETS.get(PO3_MODE, PO3_PRESETS["small"])
+    t = d["time"].tolist()
+    h, l, c = d["h"].to_numpy(), d["l"].to_numpy(), d["c"].to_numpy()
+    bo, bh, bl, bc = (d[k].to_numpy() for k in ("bo", "bh", "bl", "bc"))
+    ao, ah, al, ac = (d[k].to_numpy() for k in ("ao", "ah", "al", "ac"))
+    atr = calc_atr(d, 50).to_numpy()
+    hh = d["h"].rolling(acc_len).max().to_numpy()
+    ll = d["l"].rolling(acc_len).min().to_numpy()
+    ema = d["c"].ewm(span=PO3E_EMA, adjust=False).mean().to_numpy()
+    sh, sl_ = last_swings(h, l, PO3E_SWING) if use_bos else (None, None)
+    n = len(d)
+    trades, rejected = [], {"echo": 0, "bos": 0}
+    state, i = 0, 0
+    acc_top = acc_bot = None
+    acc_end = 0
+    while i < n - 1:
+        a = atr[i]
+        if np.isnan(hh[i]) or np.isnan(a):
+            i += 1
+            continue
+        if state == 0 and hh[i] - ll[i] <= acc_mult * a:
+            state, acc_end = 1, i
+            acc_top, acc_bot = hh[i] + 0.5 * a, ll[i] - 0.5 * a
+        if state == 1:
+            if h[i] > acc_top or l[i] < acc_bot:
+                state = 2
+            else:
+                acc_end = i
+        direction = 0
+        if state == 2 and i > acc_end:
+            if h[i] > acc_top + manip_mult * a:
+                direction = -1
+            elif l[i] < acc_bot - manip_mult * a:
+                direction = 1
+        if direction == 0:
+            i += 1
+            continue
+        state = 0
+        signal_bar = i
+        if use_bos:
+            found = None
+            for m in range(i + 1, min(i + PO3E_BOS_WINDOW, n - 2) + 1):
+                level = sh[m - 1] if direction == 1 else sl_[m - 1]
+                if np.isnan(level):
+                    continue
+                if direction == 1 and c[m] > level and c[m] > ema[m]:
+                    found = m
+                    break
+                if direction == -1 and c[m] < level and c[m] < ema[m]:
+                    found = m
+                    break
+            if found is None:
+                rejected["bos"] += 1
+                i += PO3E_BOS_WINDOW + 1
+                continue
+            signal_bar = found
+        if use_echo and echo_direction(c, signal_bar) != direction:
+            rejected["echo"] += 1
+            i = signal_bar + 1
+            continue
+        j = signal_bar + 1
+        entry = ao[j] if direction == 1 else bo[j]
+        risk = PO3_SL_ATR * atr[signal_bar]
+        sl, tp = entry - direction * risk, entry + direction * PO3_RR * risk
+        r, k = _fixed_exit(direction, j, entry, sl, tp, PO3_RR, risk, bh, bl, bc, ah, al, ac, n)
+        if t[j] >= start_ts:
+            trades.append({"pair": pair, "entry": t[j], "exit": t[k], "dir": direction, "r": float(r),
+                           "risk_pips": risk / pip(pair), "spread_frac": (ao[j] - bo[j]) / risk})
+        i = k + 1
+    return trades, rejected
+
+
+def run_backtest_po3e(api, days):
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+    start_ts = pd.Timestamp(start)
+    log.info(f"BACKTEST | Power Of Three + Echo Forecast | {TIMEFRAME} | last {days} days | pairs {PO3S_PAIRS}")
+    rows = {"Flux ref": [], "PO3+Echo": []}
+    rej = {"echo": 0, "bos": 0}
+    for pair in PO3S_PAIRS:
+        try:
+            sig = fetch_range(api, pair, TIMEFRAME, start - timedelta(days=10))
+            if len(sig) < 300:
+                log.info(f"{pair} | not enough history, skipped")
+                continue
+            rows["Flux ref"] += simulate_po3(sig, pair, start_ts)
+            tr, rj = simulate_po3_echo(sig, pair, start_ts, use_echo=True, use_bos=False)
+            rows["PO3+Echo"] += tr
+            for k2 in rej:
+                rej[k2] += rj[k2]
+            log.info(f"{pair} | done | PO3+Echo: {len(tr)} trades")
+        except Exception as e:
+            log.error(f"{pair} | BACKTEST ERROR | {e}")
+
+    log.info("")
+    log.info(f"===== PO3 + ECHO | {TIMEFRAME} | last {days} days | results in R =====")
+    log.info(f"{'':<8}{'n':>5}{'win':>6}{'avgR':>6}{'PF':>5}{'1st':>6}{'2nd':>6}")
+    for label, tr in rows.items():
+        log.info(_summary_line(label, tr))
+    log.info("Flux ref = plain Power Of Three (for comparison). PO3+Echo = the candidate.")
+    log.info(f"Setups skipped because Echo disagreed: {rej['echo']}.")
+    log.info(f"Targets {PO3_RR:g}R per 1R risked, so it needs {100 / (1 + PO3_RR):.0f}%+ wins to break even.")
+    log.info("Need: avgR above 0 in BOTH halves, PF above 1.2, a few hundred trades.")
+    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+
+
+# ----------------------------------------------------------------------------
 # LIVE
 # ----------------------------------------------------------------------------
 def place_order(api, pair, direction, sl, tp=None):
@@ -1527,6 +1690,8 @@ def main():
             run_backtest_po3s(api, days)
         elif strategy == "po3c":
             run_backtest_po3c(api, days)
+        elif strategy == "po3e":
+            run_backtest_po3e(api, days)
         else:
             run_backtest(api, days)
         while True:  # idle so Railway does not keep re-running it
