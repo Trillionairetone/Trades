@@ -6,7 +6,8 @@ Filters: ADX (no ranges), Bollinger squeeze, tick volume, higher-timeframe trend
          daily support/resistance, spread vs risk
 Risk   : stop = ATR x multiplier (with a minimum), take profit = 3 x risk (1:3)
 Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
-Exits  : backtest compares a fixed 1:3 target against "flip" (exit when UT Bot signals the other way)
+Exits  : backtest compares "flip" (exit when UT Bot signals the other way) with "sr" (same, plus a take-profit
+         zone just before the next daily support/resistance level)
 
 Run:      python bot.py
 Backtest: set Railway variable MODE=backtest (optionally BACKTEST_DAYS=180 and
@@ -67,6 +68,9 @@ MAX_SPREAD_RISK = _f("MAX_SPREAD_RISK", 0.25)  # skip if spread > this share of 
 
 MAX_BARS_HELD = _i("MAX_BARS_HELD", 96)      # backtest only: close fixed-target trades after 24h
 FLIP_MAX_BARS = _i("FLIP_MAX_BARS", 960)     # backtest only: longest a flip-exit trade can run (10 days)
+SR_TP_BUFFER_ATR = _f("SR_TP_BUFFER_ATR", 0.25)  # "sr" exit: take profit this many ATR before the level (the zone edge)
+SR_MIN_R = _f("SR_MIN_R", 1.0)               # "sr" exit: ignore levels closer than this many R
+SR_MAX_R = _f("SR_MAX_R", 6.0)               # "sr" exit: levels farther than this are ignored (trade just rides to the flip)
 STALE_SECONDS = _i("STALE_SECONDS", 300)     # ignore signals older than this (live)
 
 
@@ -392,12 +396,29 @@ def simulate(d, pair, daily, start_ts, use_filters, exit_mode="fixed"):
         r = None
         flipped = False
         k = j
-        if exit_mode == "flip":
+        if exit_mode in ("flip", "sr"):
             end = min(j + FLIP_MAX_BARS, n - 1)
+            tp = None
+            if exit_mode == "sr":  # take profit at the edge of the next daily S/R zone
+                res_l, sup_l = sr_levels(daily, d["close_time"].iloc[i], cache=True)
+                if direction == 1:
+                    cands = [x for x in res_l if x > entry]
+                    lvl = min(cands) if cands else None
+                else:
+                    cands = [x for x in sup_l if x < entry]
+                    lvl = max(cands) if cands else None
+                if lvl is not None:
+                    tp_c = lvl - direction * SR_TP_BUFFER_ATR * atr[i]
+                    reward = direction * (tp_c - entry)
+                    if SR_MIN_R * risk <= reward <= SR_MAX_R * risk:
+                        tp = tp_c
             for k in range(j, end + 1):
                 if direction == 1:  # long exits at the bid
                     if bl[k] <= sl:
                         r = -1.0
+                        break
+                    if tp is not None and bh[k] >= tp:
+                        r = (tp - entry) / risk
                         break
                     if usell[k] and k + 1 <= n - 1:
                         r = (bo[k + 1] - entry) / risk
@@ -406,6 +427,9 @@ def simulate(d, pair, daily, start_ts, use_filters, exit_mode="fixed"):
                 else:  # short exits at the ask
                     if ah[k] >= sl:
                         r = -1.0
+                        break
+                    if tp is not None and al[k] <= tp:
+                        r = (entry - tp) / risk
                         break
                     if ubuy[k] and k + 1 <= n - 1:
                         r = (entry - ao[k + 1]) / risk
@@ -502,59 +526,55 @@ def run_backtest(api, days):
                 log.error(f"{pair} | BACKTEST ERROR | {e}")
 
         # plain UT Bot (no filters) does not depend on the ADX setting, so run it once per key
-        base = {"fixed UT": [], "flip UT": []}
+        base = {"flip UT": [], "sr UT": []}
         for pair, d in prepared.items():
             dly = data[pair][2]
-            for name, mode in (("fixed UT", "fixed"), ("flip UT", "flip")):
+            for name, mode in (("flip UT", "flip"), ("sr UT", "sr")):
                 tr, _ = simulate(d, pair, dly, start_ts, False, mode)
                 base[name] += tr
-                if name == "flip UT":
-                    per_pair[pair]["flip UT"] = stats(tr)
+                per_pair[pair][name] = stats(tr)
 
         log.info("")
         log.info(f"===== BACKTEST | {TIMEFRAME} | UT_KEY {key:g} | last {days} days | results in R (multiples of risk) =====")
         log.info(f"{'':<18}{'trades':>6}{'win%':>9}{'avgR':>8}{'totalR':>9}{'PF':>7}{'maxDD':>9}")
-        log.info(stat_line("fixed UT", base["fixed UT"]))
         log.info(stat_line("flip UT", base["flip UT"]))
+        log.info(stat_line("sr UT", base["sr UT"]))
 
         for adx in adxs:
             ADX_MIN = adx
-            plus = {"fixed": [], "flip": []}
+            plus = {"flip": [], "sr": []}
             skip = {}
             for pair, d in prepared.items():
                 dly = data[pair][2]
-                for mode in ("fixed", "flip"):
+                for mode in ("flip", "sr"):
                     tr, sk = simulate(d, pair, dly, start_ts, True, mode)
                     plus[mode] += tr
-                    if mode == "fixed":
+                    if mode == "flip":
                         for k2, v in sk.items():
                             skip[k2] = skip.get(k2, 0) + v
                     per_pair[pair][f"{mode} UT+"] = stats(tr)
             tag = f"ADX{adx:g}"
-            ordered = sorted(plus["flip"], key=lambda t: t["entry"])
-            half = len(ordered) // 2
-            log.info(stat_line(f"{tag} fixed", plus["fixed"]))
-            log.info(stat_line(f"{tag} flip", plus["flip"]))
-            log.info(stat_line(f"{tag} flip 1st", ordered[:half]))
-            log.info(stat_line(f"{tag} flip 2nd", ordered[half:]))
+            for mode in ("flip", "sr"):
+                ordered = sorted(plus[mode], key=lambda t: t["entry"])
+                half = len(ordered) // 2
+                log.info(stat_line(f"{tag} {mode}", plus[mode]))
+                log.info(stat_line(f"{tag} {mode} 1st", ordered[:half]))
+                log.info(stat_line(f"{tag} {mode} 2nd", ordered[half:]))
             top = sorted(skip.items(), key=lambda x: -x[1])[:4]
-            log.info(f"  blocked: " + (", ".join(f"{k2} {v}" for k2, v in top) or "none"))
+            log.info("  blocked: " + (", ".join(f"{k2} {v}" for k2, v in top) or "none"))
         ADX_MIN = orig_adx
 
     if single:
         log.info("")
-        log.info(f"{'pair':<10}{'fixed UT+ R':>13}{'flip UT R':>12}{'flip UT+ R':>13}{'flip UT+ n':>12}")
+        log.info(f"{'pair':<10}{'flip UT+ R':>13}{'sr UT+ R':>11}{'sr UT+ n':>10}")
         for pair, row in per_pair.items():
-            if "flip UT+" not in row:
+            if "sr UT+" not in row:
                 continue
-            log.info(
-                f"{pair:<10}{row['fixed UT+']['total']:>13.1f}{row['flip UT']['total']:>12.1f}"
-                f"{row['flip UT+']['total']:>13.1f}{row['flip UT+']['n']:>12}"
-            )
+            log.info(f"{pair:<10}{row['flip UT+']['total']:>13.1f}{row['sr UT+']['total']:>11.1f}{row['sr UT+']['n']:>10}")
 
     log.info("")
-    log.info(f"fixed exit: break-even win rate is {100.0 / (1.0 + RR):.0f}% at 1:{RR:g}. flip exit: just needs avgR above 0.")
-    log.info("ADX0 means the ADX filter is off. Look for: avgR above 0 in BOTH halves, PF above 1.2, 100+ trades, and a similar result for neighbouring settings (one lucky setting is probably noise).")
+    log.info("flip = stop + exit when UT flips. sr = the same, plus take profit just before the next daily S/R level (when one is 1R to 6R away).")
+    log.info("Need: avgR above 0 in BOTH halves, PF above 1.2, a few hundred trades, similar results for neighbouring UT_KEY values.")
     log.info("Backtests ignore slippage, swap fees and news gaps. Treat them as a sanity check, not a promise.")
     log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
 
