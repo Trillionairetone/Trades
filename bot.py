@@ -1,8 +1,8 @@
 """
 UT+ bot for OANDA  (bot.py)
 
-Signal : UT Bot style ATR trailing stop flip on M15 (same maths as the TradingView script)
-Filters: ADX (no ranges), Bollinger squeeze, tick volume, H1 trend (EMA50/EMA200),
+Signal : UT Bot style ATR trailing stop flip on M15, H1 or H4 (TIMEFRAME variable, default M15)
+Filters: ADX (no ranges), Bollinger squeeze, tick volume, higher-timeframe trend (EMA50/EMA200),
          daily support/resistance, spread vs risk
 Risk   : stop = ATR x multiplier (with a minimum), take profit = 3 x risk (1:3)
 Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
@@ -12,6 +12,7 @@ Run:      python bot.py
 Backtest: set Railway variable MODE=backtest (optionally BACKTEST_DAYS=180 and
           BACKTEST_KEYS=1,2,3 and BACKTEST_ADX=0,15,20,25 to compare settings) and redeploy,
           or run: python bot.py backtest 180
+          Test another timeframe with TIMEFRAME=H1 (or H4), e.g. BACKTEST_DAYS=365.
 """
 import logging
 import os
@@ -67,6 +68,17 @@ MAX_SPREAD_RISK = _f("MAX_SPREAD_RISK", 0.25)  # skip if spread > this share of 
 MAX_BARS_HELD = _i("MAX_BARS_HELD", 96)      # backtest only: close fixed-target trades after 24h
 FLIP_MAX_BARS = _i("FLIP_MAX_BARS", 960)     # backtest only: longest a flip-exit trade can run (10 days)
 STALE_SECONDS = _i("STALE_SECONDS", 300)     # ignore signals older than this (live)
+
+
+TIMEFRAME = os.getenv("TIMEFRAME", "M15").upper()
+TF_MIN = {"M15": 15, "H1": 60, "H4": 240}            # candle length in minutes
+HTF_OF = {"M15": "H1", "H1": "H4", "H4": "D"}        # trend-filter timeframe
+HTF_MIN = {"H1": 60, "H4": 240, "D": 1440}
+SIG_WARMUP = {"M15": 5, "H1": 15, "H4": 40}          # backtest: extra days of history for indicators
+HTF_WARMUP = {"M15": 25, "H1": 70, "H4": 320}        # backtest: extra days for the trend EMAs
+if TIMEFRAME not in TF_MIN:
+    raise RuntimeError(f"TIMEFRAME must be one of {list(TF_MIN)}, got {TIMEFRAME!r}")
+HTF = HTF_OF[TIMEFRAME]
 
 
 def pip(pair):
@@ -255,18 +267,18 @@ def prepare(m15, key=None):
     d["bw"] = (4 * sd) / mid
     d["bw_cut"] = d["bw"].rolling(100).quantile(SQUEEZE_PCT)
     d["vol_ratio"] = d["volume"] / d["volume"].rolling(20).mean()
-    d["close_time"] = d["time"] + pd.Timedelta(minutes=15)
+    d["close_time"] = d["time"] + pd.Timedelta(minutes=TF_MIN[TIMEFRAME])
     return d
 
 
-def add_htf_trend(d, h1):
-    """Attach the H1 trend (1 up, -1 down, 0 unknown) using only COMPLETED H1 candles."""
-    h = h1.copy().reset_index(drop=True)
+def add_htf_trend(d, htf_df):
+    """Attach the higher-timeframe trend (1 up, -1 down, 0 unknown) using only COMPLETED candles."""
+    h = htf_df.copy().reset_index(drop=True)
     h["ema50"] = h["c"].ewm(span=50, adjust=False).mean()
     h["ema200"] = h["c"].ewm(span=200, adjust=False).mean()
     h["htf"] = np.where(h["ema50"] > h["ema200"], 1, -1)
     h.loc[h.index < 200, "htf"] = 0  # not enough history yet
-    h["avail"] = h["time"] + pd.Timedelta(hours=1)
+    h["avail"] = h["time"] + pd.Timedelta(minutes=HTF_MIN[HTF])
     m = pd.merge_asof(
         d.sort_values("close_time"),
         h[["avail", "htf"]].sort_values("avail"),
@@ -464,28 +476,28 @@ def run_backtest(api, days):
     single = len(keys) == 1 and len(adxs) == 1
     orig_adx = ADX_MIN
     log.info(
-        f"BACKTEST | last {days} days | {len(PAIRS)} pairs | UT_KEY {keys} | ADX_MIN {adxs} | fetching OANDA history..."
+        f"BACKTEST | {TIMEFRAME} | last {days} days | {len(PAIRS)} pairs | UT_KEY {keys} | ADX_MIN {adxs} | fetching OANDA history..."
     )
     data = {}
     for pair in PAIRS:
         try:
-            m15 = fetch_range(api, pair, "M15", start - timedelta(days=5))
-            h1 = fetch_range(api, pair, "H1", start - timedelta(days=25))
-            dly = fetch_range(api, pair, "D", start - timedelta(days=120))
-            if len(m15) < 300 or len(h1) < 250:
+            sig = fetch_range(api, pair, TIMEFRAME, start - timedelta(days=SIG_WARMUP[TIMEFRAME]))
+            htf = fetch_range(api, pair, HTF, start - timedelta(days=HTF_WARMUP[TIMEFRAME]))
+            dly = htf if HTF == "D" else fetch_range(api, pair, "D", start - timedelta(days=120))
+            if len(sig) < 300 or len(htf) < 250:
                 log.info(f"{pair} | not enough history, skipped")
                 continue
-            data[pair] = (m15, h1, dly)
-            log.info(f"{pair} | history loaded | {len(m15)} M15 candles")
+            data[pair] = (sig, htf, dly)
+            log.info(f"{pair} | history loaded | {len(sig)} {TIMEFRAME} candles")
         except Exception as e:
             log.error(f"{pair} | BACKTEST ERROR | {e}")
 
     per_pair = {p: {} for p in data}
     for key in keys:
         prepared = {}
-        for pair, (m15, h1, dly) in data.items():
+        for pair, (sig, htf, dly) in data.items():
             try:
-                prepared[pair] = add_htf_trend(prepare(m15, key), h1)
+                prepared[pair] = add_htf_trend(prepare(sig, key), htf)
             except Exception as e:
                 log.error(f"{pair} | BACKTEST ERROR | {e}")
 
@@ -500,7 +512,7 @@ def run_backtest(api, days):
                     per_pair[pair]["flip UT"] = stats(tr)
 
         log.info("")
-        log.info(f"===== BACKTEST | UT_KEY {key:g} | last {days} days | results in R (multiples of risk) =====")
+        log.info(f"===== BACKTEST | {TIMEFRAME} | UT_KEY {key:g} | last {days} days | results in R (multiples of risk) =====")
         log.info(f"{'':<18}{'trades':>6}{'win%':>9}{'avgR':>8}{'totalR':>9}{'PF':>7}{'maxDD':>9}")
         log.info(stat_line("fixed UT", base["fixed UT"]))
         log.info(stat_line("flip UT", base["flip UT"]))
@@ -575,17 +587,16 @@ def place_order(api, pair, direction, sl, tp):
 
 
 def process_pair(api, pair, prices, open_pairs):
-    m15 = fetch_recent(api, pair, "M15", 500)
-    if len(m15) < 200:
+    sig = fetch_recent(api, pair, TIMEFRAME, 500)
+    if len(sig) < 200:
         log.info(f"{pair} | NO TRADE | blocked: not enough candles")
         return
-    h1 = fetch_recent(api, pair, "H1", 300)
-    d = add_htf_trend(prepare(m15), h1)
+    htf = fetch_recent(api, pair, HTF, 300)
+    d = add_htf_trend(prepare(sig), htf)
     row = d.iloc[-1]
     now = pd.Timestamp(datetime.now(timezone.utc))
     if (now - row["close_time"]).total_seconds() > STALE_SECONDS:
-        log.info(f"{pair} | NO TRADE | blocked: stale data (market closed?)")
-        return
+        return False  # no fresh candle for this pair yet (market closed, or between candle closes)
 
     trend = trend_label(row)
     direction = 1 if row["ut_buy"] else (-1 if row["ut_sell"] else 0)
@@ -635,11 +646,15 @@ def live_cycle(api):
     open_pairs = {t["instrument"] for t in trades}
     prices = get_prices(api)
     log.info(f"--- scan | {len(open_pairs)} open trade(s) ---")
+    evaluated = 0
     for pair in PAIRS:
         try:
-            process_pair(api, pair, prices, open_pairs)
+            if process_pair(api, pair, prices, open_pairs) is not False:
+                evaluated += 1
         except Exception as e:
             log.error(f"{pair} | ERROR | {e}")
+    if evaluated == 0:
+        log.info(f"no new {TIMEFRAME} candle yet (market closed, or waiting for the next close)")
 
 
 def seconds_to_next_bar():
@@ -659,11 +674,11 @@ def main():
             time.sleep(3600)
 
     log.info(
-        f"UT+ bot live | {len(PAIRS)} pairs | units {UNITS} | SL {SL_ATR_MULT}xATR (min {MIN_STOP_PIPS} pips) | RR 1:{RR:g}"
+        f"UT+ bot live | {TIMEFRAME} | {len(PAIRS)} pairs | units {UNITS} | SL {SL_ATR_MULT}xATR (min {MIN_STOP_PIPS} pips) | RR 1:{RR:g}"
     )
     while True:
         wait = seconds_to_next_bar()
-        log.info(f"Waiting {wait:.0f}s for the next 15-minute candle close...")
+        log.info(f"Waiting {wait:.0f}s for the next 15-minute mark...")
         time.sleep(wait)
         try:
             live_cycle(api)
