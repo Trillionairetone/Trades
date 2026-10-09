@@ -4,8 +4,10 @@ UT+ bot for OANDA  (bot.py)
 Signal : UT Bot style ATR trailing stop flip on M15, H1 or H4 (TIMEFRAME variable, default M15)
 Filters: ADX (no ranges), Bollinger squeeze, tick volume, higher-timeframe trend (EMA50/EMA200),
          daily support/resistance, spread vs risk
-Risk   : stop = ATR x multiplier (with a minimum), take profit = 3 x risk (1:3)
+Risk   : stop = 1.5 x ATR (STOP_MODE=atr) or the UT trailing-stop distance (STOP_MODE=ut), with a minimum size
 Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
+Live   : EXIT_MODE=fixed (stop + 1:3 target, default) or EXIT_MODE=flip (stop only, the bot closes the
+         trade itself when UT Bot signals the other way; only trades the bot opened are managed)
 Exits  : backtest compares "flip" (exit when UT Bot signals the other way) with "sr" (same, plus a take-profit
          zone just before the next daily support/resistance level)
 
@@ -67,7 +69,7 @@ SR_BUFFER_R = _f("SR_BUFFER_R", 1.0)         # block if opposing daily level is 
 MAX_SPREAD_RISK = _f("MAX_SPREAD_RISK", 0.25)  # skip if spread > this share of risk
 
 MAX_BARS_HELD = _i("MAX_BARS_HELD", 96)      # backtest only: close fixed-target trades after 24h
-FLIP_MAX_BARS = _i("FLIP_MAX_BARS", 960)     # backtest only: longest a flip-exit trade can run (10 days)
+FLIP_MAX_BARS = _i("FLIP_MAX_BARS", {"M15": 2880, "H1": 960, "H4": 240}.get(os.getenv("TIMEFRAME", "M15").upper(), 960))  # backtest only: ~30-40 days
 SR_TP_BUFFER_ATR = _f("SR_TP_BUFFER_ATR", 0.25)  # "sr" exit: take profit this many ATR before the level (the zone edge)
 SR_MIN_R = _f("SR_MIN_R", 1.0)               # "sr" exit: ignore levels closer than this many R
 SR_MAX_R = _f("SR_MAX_R", 6.0)               # "sr" exit: levels farther than this are ignored (trade just rides to the flip)
@@ -83,6 +85,13 @@ HTF_WARMUP = {"M15": 25, "H1": 70, "H4": 320}        # backtest: extra days for 
 if TIMEFRAME not in TF_MIN:
     raise RuntimeError(f"TIMEFRAME must be one of {list(TF_MIN)}, got {TIMEFRAME!r}")
 HTF = HTF_OF[TIMEFRAME]
+EXIT_MODE = os.getenv("EXIT_MODE", "fixed").lower()  # live exits: "fixed" = stop + RR target, "flip" = stop + close on UT flip
+if EXIT_MODE not in ("fixed", "flip"):
+    raise RuntimeError(f"EXIT_MODE must be 'fixed' or 'flip', got {EXIT_MODE!r}")
+STOP_MODE = os.getenv("STOP_MODE", "atr").lower()    # "atr": stop = SL_ATR_MULT x ATR(14); "ut": stop = the UT trailing-stop distance (UT_KEY x ATR(UT_ATR))
+if STOP_MODE not in ("atr", "ut"):
+    raise RuntimeError(f"STOP_MODE must be 'atr' or 'ut', got {STOP_MODE!r}")
+MANAGED_TAG = "utflip"                               # marks trades opened by this bot, so old/manual trades are never touched
 
 
 def pip(pair):
@@ -140,6 +149,14 @@ class Oanda:
     def post(self, path, body):
         # no retries on purpose, so an order can never be sent twice
         r = self.s.post(self.base + path, json=body, timeout=30)
+        try:
+            return r.status_code, r.json()
+        except ValueError:
+            return r.status_code, {"raw": r.text[:300]}
+
+    def put(self, path, body):
+        # no retries on purpose; a failed close is simply tried again on the next scan
+        r = self.s.put(self.base + path, json=body, timeout=30)
         try:
             return r.status_code, r.json()
         except ValueError:
@@ -265,6 +282,7 @@ def prepare(m15, key=None):
     d = m15.copy()
     d["ut_stop"], d["ut_buy"], d["ut_sell"] = ut_bot(d, UT_KEY if key is None else key, UT_ATR)
     d["atr"] = calc_atr(d, ATR_PERIOD)
+    d["ut_loss"] = (UT_KEY if key is None else key) * calc_atr(d, UT_ATR)  # distance of the UT trailing stop from price
     d["adx"] = calc_adx(d, 14)
     mid = d["c"].rolling(20).mean()
     sd = d["c"].rolling(20).std(ddof=0)
@@ -321,8 +339,10 @@ def sr_levels(daily, as_of, lookback=90, cache=False):
     return res, sup
 
 
-def calc_risk(pair, atr):
-    return max(SL_ATR_MULT * atr, MIN_STOP_PIPS * pip(pair))
+def calc_risk(pair, atr, ut_loss=None, stop_mode=None):
+    mode = stop_mode or STOP_MODE
+    base = ut_loss if (mode == "ut" and ut_loss is not None) else SL_ATR_MULT * atr
+    return max(base, MIN_STOP_PIPS * pip(pair))
 
 
 def sr_blocked(direction, price, risk, res, sup):
@@ -360,12 +380,13 @@ def trend_label(row):
 # ----------------------------------------------------------------------------
 # BACKTEST
 # ----------------------------------------------------------------------------
-def simulate(d, pair, daily, start_ts, use_filters, exit_mode="fixed"):
+def simulate(d, pair, daily, start_ts, use_filters, exit_mode="fixed", stop_mode=None):
     """exit_mode "fixed": stop + 1:RR target.  "flip": stop + exit when UT Bot signals the other way."""
     times = d["time"].tolist()
     bo, bh, bl, bc = (d[c].to_numpy() for c in ("bo", "bh", "bl", "bc"))
     ao, ah, al, ac = (d[c].to_numpy() for c in ("ao", "ah", "al", "ac"))
     atr = d["atr"].to_numpy()
+    utl = d["ut_loss"].to_numpy()
     ubuy = d["ut_buy"].to_numpy()
     usell = d["ut_sell"].to_numpy()
     n = len(d)
@@ -379,7 +400,7 @@ def simulate(d, pair, daily, start_ts, use_filters, exit_mode="fixed"):
             continue
         j = i + 1  # enter at the open of the next candle
         entry = ao[j] if direction == 1 else bo[j]
-        risk = calc_risk(pair, atr[i])
+        risk = calc_risk(pair, atr[i], utl[i], stop_mode)
         reason = None
         if use_filters:
             reason = filter_reason(d.iloc[i], direction, risk, entry, [], [])
@@ -497,12 +518,20 @@ def run_backtest(api, days):
     start_ts = pd.Timestamp(start)
     keys = [float(x) for x in os.getenv("BACKTEST_KEYS", "").split(",") if x.strip()] or [UT_KEY]
     adxs = [float(x) for x in os.getenv("BACKTEST_ADX", "").split(",") if x.strip()] or [ADX_MIN]
-    single = len(keys) == 1 and len(adxs) == 1
+    stops = [x.strip().lower() for x in os.getenv("BACKTEST_STOPS", "").split(",") if x.strip()] or [STOP_MODE]
+    for s in stops:
+        if s not in ("atr", "ut"):
+            raise RuntimeError(f"BACKTEST_STOPS values must be atr or ut, got {s!r}")
+    show_sr = os.getenv("BACKTEST_SR", "0") == "1"      # the S/R take-profit exit is hidden unless BACKTEST_SR=1
+    detail = os.getenv("BACKTEST_DETAIL", "1") != "0"   # BACKTEST_DETAIL=0 prints only the short summary table
+    modes = ("flip", "sr") if show_sr else ("flip",)
+    single = len(keys) == 1 and len(adxs) == 1 and len(stops) == 1
     orig_adx = ADX_MIN
     log.info(
-        f"BACKTEST | {TIMEFRAME} | last {days} days | {len(PAIRS)} pairs | UT_KEY {keys} | ADX_MIN {adxs} | fetching OANDA history..."
+        f"BACKTEST | {TIMEFRAME} | last {days} days | {len(PAIRS)} pairs | stop {stops} | UT_KEY {keys} | "
+        f"ADX_MIN {adxs} | working through the pairs..."
     )
-    data = {}
+    acc, skip_acc, per_pair = {}, {}, {}
     for pair in PAIRS:
         try:
             sig = fetch_range(api, pair, TIMEFRAME, start - timedelta(days=SIG_WARMUP[TIMEFRAME]))
@@ -511,70 +540,81 @@ def run_backtest(api, days):
             if len(sig) < 300 or len(htf) < 250:
                 log.info(f"{pair} | not enough history, skipped")
                 continue
-            data[pair] = (sig, htf, dly)
-            log.info(f"{pair} | history loaded | {len(sig)} {TIMEFRAME} candles")
+            for key in keys:
+                d = add_htf_trend(prepare(sig, key), htf)
+                for stop in stops:
+                    for mode in modes:  # plain UT Bot, no filters (does not depend on ADX)
+                        tr, _ = simulate(d, pair, dly, start_ts, False, mode, stop)
+                        acc.setdefault((stop, key, None, mode), []).extend(tr)
+                    for adx in adxs:
+                        ADX_MIN = adx
+                        for mode in modes:
+                            tr, sk = simulate(d, pair, dly, start_ts, True, mode, stop)
+                            acc.setdefault((stop, key, adx, mode), []).extend(tr)
+                            if mode == "flip":
+                                sa = skip_acc.setdefault((stop, key, adx), {})
+                                for k2, v in sk.items():
+                                    sa[k2] = sa.get(k2, 0) + v
+                                per_pair.setdefault(pair, {})[(stop, key, adx)] = stats(tr)
+                        ADX_MIN = orig_adx
+            log.info(f"{pair} | done | {len(sig)} {TIMEFRAME} candles")
         except Exception as e:
+            ADX_MIN = orig_adx
             log.error(f"{pair} | BACKTEST ERROR | {e}")
 
-    per_pair = {p: {} for p in data}
-    for key in keys:
-        prepared = {}
-        for pair, (sig, htf, dly) in data.items():
-            try:
-                prepared[pair] = add_htf_trend(prepare(sig, key), htf)
-            except Exception as e:
-                log.error(f"{pair} | BACKTEST ERROR | {e}")
+    def halves(trades):
+        ordered = sorted(trades, key=lambda t: t["entry"])
+        h = len(ordered) // 2
+        return ordered[:h], ordered[h:]
 
-        # plain UT Bot (no filters) does not depend on the ADX setting, so run it once per key
-        base = {"flip UT": [], "sr UT": []}
-        for pair, d in prepared.items():
-            dly = data[pair][2]
-            for name, mode in (("flip UT", "flip"), ("sr UT", "sr")):
-                tr, _ = simulate(d, pair, dly, start_ts, False, mode)
-                base[name] += tr
-                per_pair[pair][name] = stats(tr)
+    if detail:
+        for stop in stops:
+            for key in keys:
+                log.info("")
+                log.info(
+                    f"===== BACKTEST | {TIMEFRAME} | stop {stop} | UT_KEY {key:g} | last {days} days | "
+                    f"results in R (multiples of risk) ====="
+                )
+                log.info(f"{'':<18}{'trades':>6}{'win%':>9}{'avgR':>8}{'totalR':>9}{'PF':>7}{'maxDD':>9}")
+                for mode in modes:
+                    log.info(stat_line(f"{mode} UT", acc.get((stop, key, None, mode), [])))
+                for adx in adxs:
+                    tag = f"ADX{adx:g}"
+                    for mode in modes:
+                        tr = acc.get((stop, key, adx, mode), [])
+                        first, second = halves(tr)
+                        log.info(stat_line(f"{tag} {mode}", tr))
+                        log.info(stat_line(f"{tag} {mode} 1st", first))
+                        log.info(stat_line(f"{tag} {mode} 2nd", second))
+                    top = sorted(skip_acc.get((stop, key, adx), {}).items(), key=lambda x: -x[1])[:4]
+                    log.info("  blocked: " + (", ".join(f"{k2} {v}" for k2, v in top) or "none"))
 
-        log.info("")
-        log.info(f"===== BACKTEST | {TIMEFRAME} | UT_KEY {key:g} | last {days} days | results in R (multiples of risk) =====")
-        log.info(f"{'':<18}{'trades':>6}{'win%':>9}{'avgR':>8}{'totalR':>9}{'PF':>7}{'maxDD':>9}")
-        log.info(stat_line("flip UT", base["flip UT"]))
-        log.info(stat_line("sr UT", base["sr UT"]))
-
-        for adx in adxs:
-            ADX_MIN = adx
-            plus = {"flip": [], "sr": []}
-            skip = {}
-            for pair, d in prepared.items():
-                dly = data[pair][2]
-                for mode in ("flip", "sr"):
-                    tr, sk = simulate(d, pair, dly, start_ts, True, mode)
-                    plus[mode] += tr
-                    if mode == "flip":
-                        for k2, v in sk.items():
-                            skip[k2] = skip.get(k2, 0) + v
-                    per_pair[pair][f"{mode} UT+"] = stats(tr)
-            tag = f"ADX{adx:g}"
-            for mode in ("flip", "sr"):
-                ordered = sorted(plus[mode], key=lambda t: t["entry"])
-                half = len(ordered) // 2
-                log.info(stat_line(f"{tag} {mode}", plus[mode]))
-                log.info(stat_line(f"{tag} {mode} 1st", ordered[:half]))
-                log.info(stat_line(f"{tag} {mode} 2nd", ordered[half:]))
-            top = sorted(skip.items(), key=lambda x: -x[1])[:4]
-            log.info("  blocked: " + (", ".join(f"{k2} {v}" for k2, v in top) or "none"))
-        ADX_MIN = orig_adx
+    log.info("")
+    log.info("===== SUMMARY | flip exit | avgR = average R per trade =====")
+    log.info(f"{'stop|key|adx':<11}{'n':>5}{'avgR':>6}{'PF':>5}{'1st':>6}{'2nd':>6}")
+    for stop in stops:
+        for key in keys:
+            for adx in [None] + adxs:
+                tr = acc.get((stop, key, adx, "flip"), [])
+                s = stats(tr)
+                first, second = halves(tr)
+                label = f"{stop}|{key:g}|" + ("none" if adx is None else f"{adx:g}")
+                log.info(
+                    f"{label:<11}{s['n']:>5}{s['avg']:>6.2f}{s['pf']:>5.2f}"
+                    f"{stats(first)['avg']:>6.2f}{stats(second)['avg']:>6.2f}"
+                )
+    log.info("none = plain UT Bot, no filters. 1st/2nd = older/newer half of the period.")
 
     if single:
         log.info("")
-        log.info(f"{'pair':<10}{'flip UT+ R':>13}{'sr UT+ R':>11}{'sr UT+ n':>10}")
+        log.info(f"{'pair':<10}{'flip UT+ R':>13}{'flip UT+ n':>12}")
         for pair, row in per_pair.items():
-            if "sr UT+" not in row:
-                continue
-            log.info(f"{pair:<10}{row['flip UT+']['total']:>13.1f}{row['sr UT+']['total']:>11.1f}{row['sr UT+']['n']:>10}")
+            r = row.get((stops[0], keys[0], adxs[0]))
+            if r:
+                log.info(f"{pair:<10}{r['total']:>13.1f}{r['n']:>12}")
 
     log.info("")
-    log.info("flip = stop + exit when UT flips. sr = the same, plus take profit just before the next daily S/R level (when one is 1R to 6R away).")
-    log.info("Need: avgR above 0 in BOTH halves, PF above 1.2, a few hundred trades, similar results for neighbouring UT_KEY values.")
+    log.info("Need: avgR above 0 in BOTH halves, PF above 1.2, a few hundred trades, and neighbouring settings that look similar.")
     log.info("Backtests ignore slippage, swap fees and news gaps. Treat them as a sanity check, not a promise.")
     log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
 
@@ -582,19 +622,20 @@ def run_backtest(api, days):
 # ----------------------------------------------------------------------------
 # LIVE
 # ----------------------------------------------------------------------------
-def place_order(api, pair, direction, sl, tp):
+def place_order(api, pair, direction, sl, tp=None):
     units = UNITS if direction == 1 else -UNITS
-    body = {
-        "order": {
-            "type": "MARKET",
-            "instrument": pair,
-            "units": str(units),
-            "timeInForce": "FOK",
-            "positionFill": "DEFAULT",
-            "stopLossOnFill": {"price": fmt_price(pair, sl), "timeInForce": "GTC"},
-            "takeProfitOnFill": {"price": fmt_price(pair, tp), "timeInForce": "GTC"},
-        }
+    order = {
+        "type": "MARKET",
+        "instrument": pair,
+        "units": str(units),
+        "timeInForce": "FOK",
+        "positionFill": "DEFAULT",
+        "stopLossOnFill": {"price": fmt_price(pair, sl), "timeInForce": "GTC"},
+        "tradeClientExtensions": {"tag": MANAGED_TAG, "comment": f"UT+ {TIMEFRAME} {EXIT_MODE}"},
     }
+    if tp is not None:  # flip mode has no target: the bot closes the trade itself when UT flips
+        order["takeProfitOnFill"] = {"price": fmt_price(pair, tp), "timeInForce": "GTC"}
+    body = {"order": order}
     status, j = api.post(f"/v3/accounts/{api.account}/orders", body)
     fill = j.get("orderFillTransaction")
     if fill:
@@ -606,7 +647,35 @@ def place_order(api, pair, direction, sl, tp):
     return False, f"ORDER REJECTED | HTTP {status} | {str(j)[:200]}"
 
 
-def process_pair(api, pair, prices, open_pairs):
+def manage_flip_exits(api, pair, d, trades_by_pair, open_pairs):
+    """EXIT_MODE=flip: close this bot's trades on a pair once UT Bot has flipped the other way since they opened."""
+    mine = [t for t in trades_by_pair.get(pair, []) if (t.get("clientExtensions") or {}).get("tag") == MANAGED_TAG]
+    if not mine:
+        return
+    flips = d[d["ut_buy"] | d["ut_sell"]]
+    if flips.empty:
+        return
+    last = flips.iloc[-1]
+    last_dir = 1 if last["ut_buy"] else -1
+    for t in mine:
+        trade_dir = 1 if float(t["currentUnits"]) > 0 else -1
+        opened = pd.Timestamp(t["openTime"])
+        # only a flip that closed AFTER the trade opened counts (the flip that opened it does not)
+        if last_dir == trade_dir or last["close_time"] <= opened:
+            continue
+        status, j = api.put(f"/v3/accounts/{api.account}/trades/{t['id']}/close", {"units": "ALL"})
+        fill = j.get("orderFillTransaction")
+        if fill:
+            log.info(f"{pair} | FLIP EXIT | closed trade {t['id']} @ {fill.get('price')} | P/L {fill.get('pl')}")
+            trades_by_pair[pair] = [x for x in trades_by_pair[pair] if x["id"] != t["id"]]
+        else:
+            log.info(f"{pair} | FLIP EXIT FAILED | trade {t['id']} | HTTP {status} | {str(j)[:200]}")
+    if not trades_by_pair.get(pair):
+        trades_by_pair.pop(pair, None)
+        open_pairs.discard(pair)
+
+
+def process_pair(api, pair, prices, open_pairs, trades_by_pair=None):
     sig = fetch_recent(api, pair, TIMEFRAME, 500)
     if len(sig) < 200:
         log.info(f"{pair} | NO TRADE | blocked: not enough candles")
@@ -615,6 +684,8 @@ def process_pair(api, pair, prices, open_pairs):
     d = add_htf_trend(prepare(sig), htf)
     row = d.iloc[-1]
     now = pd.Timestamp(datetime.now(timezone.utc))
+    if EXIT_MODE == "flip" and trades_by_pair:
+        manage_flip_exits(api, pair, d, trades_by_pair, open_pairs)  # runs even on a stale candle, so a missed flip is caught up
     if (now - row["close_time"]).total_seconds() > STALE_SECONDS:
         return False  # no fresh candle for this pair yet (market closed, or between candle closes)
 
@@ -637,7 +708,7 @@ def process_pair(api, pair, prices, open_pairs):
 
     bid, ask = prices[pair]
     entry = ask if direction == 1 else bid
-    risk = calc_risk(pair, row["atr"])
+    risk = calc_risk(pair, row["atr"], row["ut_loss"])
     dly = fetch_recent(api, pair, "D", 120)
     res, sup = sr_levels(dly, now)
     reason = filter_reason(row, direction, risk, entry, res, sup)
@@ -650,11 +721,18 @@ def process_pair(api, pair, prices, open_pairs):
         return
 
     sl = entry - direction * risk
-    tp = entry + direction * RR * risk
-    log.info(
-        f"{pair} | {trend} | {side} | SIGNAL ENTRY {fmt_price(pair, entry)} "
-        f"SL {fmt_price(pair, sl)} TP {fmt_price(pair, tp)} | RR 1:{RR:.1f}"
-    )
+    if EXIT_MODE == "flip":
+        tp = None
+        log.info(
+            f"{pair} | {trend} | {side} | SIGNAL ENTRY {fmt_price(pair, entry)} "
+            f"SL {fmt_price(pair, sl)} | exit when UT flips"
+        )
+    else:
+        tp = entry + direction * RR * risk
+        log.info(
+            f"{pair} | {trend} | {side} | SIGNAL ENTRY {fmt_price(pair, entry)} "
+            f"SL {fmt_price(pair, sl)} TP {fmt_price(pair, tp)} | RR 1:{RR:.1f}"
+        )
     ok, msg = place_order(api, pair, direction, sl, tp)
     log.info(f"{pair} | {msg}")
     if ok:
@@ -663,13 +741,16 @@ def process_pair(api, pair, prices, open_pairs):
 
 def live_cycle(api):
     trades = api.get(f"/v3/accounts/{api.account}/openTrades").get("trades", [])
-    open_pairs = {t["instrument"] for t in trades}
+    trades_by_pair = {}
+    for t in trades:
+        trades_by_pair.setdefault(t["instrument"], []).append(t)
+    open_pairs = set(trades_by_pair)
     prices = get_prices(api)
-    log.info(f"--- scan | {len(open_pairs)} open trade(s) ---")
+    log.info(f"--- scan | {len(trades)} open trade(s) | exit {EXIT_MODE} ---")
     evaluated = 0
     for pair in PAIRS:
         try:
-            if process_pair(api, pair, prices, open_pairs) is not False:
+            if process_pair(api, pair, prices, open_pairs, trades_by_pair) is not False:
                 evaluated += 1
         except Exception as e:
             log.error(f"{pair} | ERROR | {e}")
@@ -693,8 +774,11 @@ def main():
         while True:  # idle so Railway does not keep re-running it
             time.sleep(3600)
 
+    stop_txt = f"{SL_ATR_MULT:g}xATR" if STOP_MODE == "atr" else "UT trail"
+    exit_txt = f"fixed (RR 1:{RR:g})" if EXIT_MODE == "fixed" else "flip"
     log.info(
-        f"UT+ bot live | {TIMEFRAME} | {len(PAIRS)} pairs | units {UNITS} | SL {SL_ATR_MULT}xATR (min {MIN_STOP_PIPS} pips) | RR 1:{RR:g}"
+        f"UT+ bot live | {TIMEFRAME} | UT_KEY {UT_KEY:g} | ADX_MIN {ADX_MIN:g} | {len(PAIRS)} pairs | "
+        f"units {UNITS} | stop {stop_txt} (min {MIN_STOP_PIPS} pips) | exit {exit_txt}"
     )
     while True:
         wait = seconds_to_next_bar()
