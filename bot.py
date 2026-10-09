@@ -6,6 +6,7 @@ Filters: ADX (no ranges), Bollinger squeeze, tick volume, higher-timeframe trend
          daily support/resistance, spread vs risk
 Risk   : stop = 1.5 x ATR (STOP_MODE=atr) or the UT trailing-stop distance (STOP_MODE=ut), with a minimum size
 Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
+         BACKTEST_STRATEGY=srbb backtests your original bot instead (daily S/R + Bollinger bounce)
 Live   : EXIT_MODE=fixed (stop + 1:3 target, default) or EXIT_MODE=flip (stop only, the bot closes the
          trade itself when UT Bot signals the other way; only trades the bot opened are managed)
 Exits  : backtest compares "flip" (exit when UT Bot signals the other way) with "sr" (same, plus a take-profit
@@ -620,6 +621,173 @@ def run_backtest(api, days):
 
 
 # ----------------------------------------------------------------------------
+# BACKTEST: the original bot (daily S/R + Bollinger bounce, candle + volume, 1:3)
+# Same rules as the old bot.py, so its results can be judged like everything else.
+# ----------------------------------------------------------------------------
+OLD_PAIRS = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "USD_CHF", "NZD_USD", "EUR_JPY", "GBP_JPY"]
+SB_ZONE_ATR = _f("SB_ZONE_ATR", 1.0)            # "near" a daily level = within this many ATR
+SB_SL_PAD_ATR = _f("SB_SL_PAD_ATR", 0.3)        # stop = 2-candle extreme +/- this many ATR
+SB_MAX_RISK_ATR = _f("SB_MAX_RISK_ATR", 2.5)    # skip if the stop is wider than this many ATR
+SB_MAX_SPREAD_FRAC = _f("SB_MAX_SPREAD_FRAC", 0.2)  # skip if spread > this share of the risk
+SB_VOL_FACTOR = _f("SB_VOL_FACTOR", 0.8)        # candle volume must beat this share of the 20-candle average
+SB_RR = _f("SB_RR", 3.0)                        # take profit = this many R
+SB_MAX_BARS = _i("SB_MAX_BARS", 2880)           # backtest only: close a trade still open after this many candles
+
+
+def prepare_srbb(sig, dly):
+    d = sig.copy()
+    o, h, l, c, v = d["o"], d["h"], d["l"], d["c"], d["volume"]
+    pc = c.shift(1)
+    tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+    tr.iloc[0] = np.nan
+    a = tr.rolling(14).mean()                    # old bot: simple 14-candle ATR
+    d["sa"] = a
+    e50 = c.ewm(span=50, adjust=False).mean()
+    e200 = c.ewm(span=200, adjust=False).mean()
+    e50_prev = e50.shift(8)
+    bull = (c > e50) & (e50 > e200) & (e50 > e50_prev)
+    bear = (c < e50) & (e50 < e200) & (e50 < e50_prev)
+    mid = c.rolling(20).mean()
+    sd = c.rolling(20).std(ddof=0)
+    lower, upper = mid - 2 * sd, mid + 2 * sd
+    vol_ok = v > SB_VOL_FACTOR * v.shift(1).rolling(20).mean()
+    po, pcl, ph, pl = o.shift(1), c.shift(1), h.shift(1), l.shift(1)
+    body = (c - o).abs()
+    rng = (h - l).where(h - l > 0, 1e-9)
+    low_wick = np.minimum(o, c) - l
+    up_wick = h - np.maximum(o, c)
+    bull_c = ((c > o) & (pcl < po) & (c >= po) & (o <= pcl)) | ((c > o) & (low_wick >= 2 * body) & (body / rng > 0.1))
+    bear_c = ((c < o) & (pcl > po) & (c <= po) & (o >= pcl)) | ((c < o) & (up_wick >= 2 * body) & (body / rng > 0.1))
+
+    # daily levels known when each candle closes: previous day's high/low and the 10-day extremes
+    dd = dly[["time", "h", "l"]].copy().reset_index(drop=True)
+    dd["s1"], dd["r1"] = dd["l"], dd["h"]
+    dd["s10"], dd["r10"] = dd["l"].rolling(10).min(), dd["h"].rolling(10).max()
+    dd["avail"] = dd["time"] + pd.Timedelta(days=1)
+    d["close_time"] = d["time"] + pd.Timedelta(minutes=TF_MIN[TIMEFRAME])
+    m = pd.merge_asof(d.sort_values("close_time"), dd[["avail", "s1", "s10", "r1", "r10"]].sort_values("avail"),
+                      left_on="close_time", right_on="avail", direction="backward")
+    m.index = d.index
+    zone = SB_ZONE_ATR * a
+    near_sup = ((l - m["s1"]).abs() <= zone) | (l < m["s1"]) | ((l - m["s10"]).abs() <= zone) | (l < m["s10"])
+    near_res = ((h - m["r1"]).abs() <= zone) | (h > m["r1"]) | ((h - m["r10"]).abs() <= zone) | (h > m["r10"])
+    touched_lo = np.minimum(l, pl) <= lower + 0.2 * a
+    touched_hi = np.maximum(h, ph) >= upper - 0.2 * a
+    level_b = (near_sup | touched_lo) & (c > lower)
+    level_s = (near_res | touched_hi) & (c < upper)
+    d["sb_buy"] = (bull & vol_ok & bull_c & level_b).fillna(False)
+    d["sb_sell"] = (bear & vol_ok & bear_c & level_s).fillna(False)
+    d["sb_sl_buy"] = np.minimum(l, pl) - SB_SL_PAD_ATR * a
+    d["sb_sl_sell"] = np.maximum(h, ph) + SB_SL_PAD_ATR * a
+    return d
+
+
+def simulate_srbb(d, pair, start_ts):
+    times = d["time"].tolist()
+    bo, bh, bl, bc = (d[k].to_numpy() for k in ("bo", "bh", "bl", "bc"))
+    ao, ah, al, ac = (d[k].to_numpy() for k in ("ao", "ah", "al", "ac"))
+    a = d["sa"].to_numpy()
+    buy, sell = d["sb_buy"].to_numpy(dtype=bool), d["sb_sell"].to_numpy(dtype=bool)
+    slb, sls = d["sb_sl_buy"].to_numpy(), d["sb_sl_sell"].to_numpy()
+    n = len(d)
+    trades, skipped = [], {}
+    busy = -1
+    for i in range(n - 1):
+        if times[i] < start_ts or i <= busy:
+            continue
+        direction = 1 if buy[i] else (-1 if sell[i] else 0)
+        if direction == 0 or np.isnan(a[i]):
+            continue
+        j = i + 1
+        entry = ao[j] if direction == 1 else bo[j]
+        sl = slb[i] if direction == 1 else sls[i]
+        risk = direction * (entry - sl)
+        spread = ao[j] - bo[j]
+        reason = None
+        if risk <= 0:
+            reason = "price beyond stop"
+        elif risk > SB_MAX_RISK_ATR * a[i]:
+            reason = "stop too wide"
+        elif spread > SB_MAX_SPREAD_FRAC * risk:
+            reason = "spread too wide"
+        if reason:
+            skipped[reason] = skipped.get(reason, 0) + 1
+            continue
+        tp = entry + direction * SB_RR * risk
+        end = min(j + SB_MAX_BARS, n - 1)
+        r = None
+        k = j
+        for k in range(j, end + 1):
+            if direction == 1:
+                if bl[k] <= sl:
+                    r = -1.0
+                    break
+                if bh[k] >= tp:
+                    r = SB_RR
+                    break
+            else:
+                if ah[k] >= sl:
+                    r = -1.0
+                    break
+                if al[k] <= tp:
+                    r = SB_RR
+                    break
+        if r is None:
+            exit_p = bc[k] if direction == 1 else ac[k]
+            r = direction * (exit_p - entry) / risk
+        busy = k
+        trades.append({"pair": pair, "entry": times[j], "exit": times[k], "dir": direction, "r": float(r),
+                       "risk_pips": risk / pip(pair), "spread_frac": spread / risk})
+    return trades, skipped
+
+
+def run_backtest_srbb(api, days):
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+    start_ts = pd.Timestamp(start)
+    pairs = PAIRS if os.getenv("PAIRS") else OLD_PAIRS
+    log.info(f"BACKTEST | original bot (S/R + Bollinger bounce, 1:{SB_RR:g}) | {TIMEFRAME} | last {days} days | {len(pairs)} pairs")
+    all_tr, skips, rows = [], {}, []
+    for pair in pairs:
+        try:
+            sig = fetch_range(api, pair, TIMEFRAME, start - timedelta(days=SIG_WARMUP[TIMEFRAME]))
+            dly = fetch_range(api, pair, "D", start - timedelta(days=40))
+            if len(sig) < 300 or len(dly) < 15:
+                log.info(f"{pair} | not enough history, skipped")
+                continue
+            tr, sk = simulate_srbb(prepare_srbb(sig, dly), pair, start_ts)
+            all_tr += tr
+            for k2, v in sk.items():
+                skips[k2] = skips.get(k2, 0) + v
+            rows.append((pair, stats(tr)))
+            log.info(f"{pair} | done | {len(tr)} trades")
+        except Exception as e:
+            log.error(f"{pair} | BACKTEST ERROR | {e}")
+
+    ordered = sorted(all_tr, key=lambda t: t["entry"])
+    half = len(ordered) // 2
+    log.info("")
+    log.info(f"===== ORIGINAL BOT | {TIMEFRAME} | last {days} days | results in R =====")
+    log.info(f"{'':<18}{'trades':>6}{'win%':>9}{'avgR':>8}{'totalR':>9}{'PF':>7}{'maxDD':>9}")
+    log.info(stat_line("all trades", all_tr))
+    log.info(stat_line("older half", ordered[:half]))
+    log.info(stat_line("newer half", ordered[half:]))
+    log.info("Skipped at entry: " + (", ".join(f"{k2} {v}" for k2, v in sorted(skips.items(), key=lambda x: -x[1])) or "none"))
+    if all_tr:
+        avg_pips = float(np.mean([t["risk_pips"] for t in all_tr]))
+        avg_spread = float(np.mean([t["spread_frac"] for t in all_tr]))
+        log.info(f"Average stop {avg_pips:.1f} pips | spread paid = {avg_spread * 100:.0f}% of the risk on average")
+    log.info("")
+    log.info(f"{'pair':<9}{'n':>5}{'win%':>7}{'totalR':>8}")
+    for pair, s in rows:
+        log.info(f"{pair:<9}{s['n']:>5}{s['win']:>6.1f}%{s['total']:>8.1f}")
+    log.info("")
+    log.info(f"Break-even win rate at 1:{SB_RR:g} is {100.0 / (1.0 + SB_RR):.0f}%. Need avgR above 0 in BOTH halves and PF above 1.2.")
+    log.info("Not modelled: the old 5-trade cap and per-currency limit (this tests the signal itself), slippage, swap fees.")
+    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+
+
+# ----------------------------------------------------------------------------
 # LIVE
 # ----------------------------------------------------------------------------
 def place_order(api, pair, direction, sl, tp=None):
@@ -770,7 +938,10 @@ def main():
     api = Oanda()
     if mode == "backtest":
         days = int(sys.argv[2]) if len(sys.argv) > 2 else _i("BACKTEST_DAYS", 90)
-        run_backtest(api, days)
+        if os.getenv("BACKTEST_STRATEGY", "ut").lower() == "srbb":
+            run_backtest_srbb(api, days)
+        else:
+            run_backtest(api, days)
         while True:  # idle so Railway does not keep re-running it
             time.sleep(3600)
 
