@@ -7,6 +7,7 @@ Filters: ADX (no ranges), Bollinger squeeze, tick volume, higher-timeframe trend
 Risk   : stop = 1.5 x ATR (STOP_MODE=atr) or the UT trailing-stop distance (STOP_MODE=ut), with a minimum size
 Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
          BACKTEST_STRATEGY=srbb backtests your original bot instead (daily S/R + Bollinger bounce)
+         BACKTEST_STRATEGY=flux backtests the two Flux Charts scripts (ICT Power Of Three, Volumized Order Blocks)
 Live   : EXIT_MODE=fixed (stop + 1:3 target, default) or EXIT_MODE=flip (stop only, the bot closes the
          trade itself when UT Bot signals the other way; only trades the bot opened are managed)
 Exits  : backtest compares "flip" (exit when UT Bot signals the other way) with "sr" (same, plus a take-profit
@@ -788,6 +789,284 @@ def run_backtest_srbb(api, days):
 
 
 # ----------------------------------------------------------------------------
+# BACKTEST: Flux Charts scripts, ported from their Pine Script
+#   PO3: "ICT Power Of Three | Flux Charts" with its default settings
+#   OB : "Volumized Order Blocks | Flux Charts" zones, traded on the first re-entry into a zone
+# ----------------------------------------------------------------------------
+PO3_PRESETS = {  # algorithm mode -> (accumulation length, max accumulation size in ATR, min manipulation size in ATR)
+    "small": (40, 5.0, 0.6),   # "Small Manipulation" (the script's default, and what your chart uses)
+    "short": (11, 2.0, 1.0),   # "Short Accumulation"
+    "big": (11, 5.0, 1.0),     # "Big Manipulation"
+}
+PO3_MODE = os.getenv("PO3_MODE", "small").lower()
+PO3_SL_ATR = _f("PO3_SL_ATR", 5.0)   # risk "Normal" = 5 x ATR(50)
+PO3_RR = _f("PO3_RR", 0.86)          # the script's fixed reward:risk
+OB_SWING_LEN = _i("OB_SWING_LEN", 10)
+OB_ZONES = _i("OB_ZONES", 3)          # zone count "Low" = the 3 newest zones of each type
+OB_SL_PAD_ATR = _f("OB_SL_PAD_ATR", 0.1)
+OB_RRS = [float(x) for x in os.getenv("OB_RRS", "1,2,3").split(",") if x.strip()]
+
+
+def simulate_po3(d, pair, start_ts):
+    acc_len, acc_mult, manip_mult = PO3_PRESETS.get(PO3_MODE, PO3_PRESETS["small"])
+    t = d["time"].tolist()
+    h, l = d["h"].to_numpy(), d["l"].to_numpy()
+    bh, bl, bc = d["bh"].to_numpy(), d["bl"].to_numpy(), d["bc"].to_numpy()
+    ao, ah, al, ac = d["ao"].to_numpy(), d["ah"].to_numpy(), d["al"].to_numpy(), d["ac"].to_numpy()
+    bo = d["bo"].to_numpy()
+    atr = calc_atr(d, 50).to_numpy()
+    hh = d["h"].rolling(acc_len).max().to_numpy()
+    ll = d["l"].rolling(acc_len).min().to_numpy()
+    n = len(d)
+    trades = []
+    state, i = 0, 0
+    acc_top = acc_bot = None
+    acc_end = 0
+    while i < n - 1:
+        a = atr[i]
+        if np.isnan(hh[i]) or np.isnan(a):
+            i += 1
+            continue
+        if state == 0 and hh[i] - ll[i] <= acc_mult * a:          # accumulation found
+            state, acc_end = 1, i
+            acc_top, acc_bot = hh[i] + 0.5 * a, ll[i] - 0.5 * a
+        if state == 1:
+            if h[i] > acc_top or l[i] < acc_bot:                   # accumulation ends
+                state = 2
+            else:
+                acc_end = i
+        direction = 0
+        if state == 2 and i > acc_end:                              # manipulation -> trade against it
+            if h[i] > acc_top + manip_mult * a:
+                direction = -1
+            elif l[i] < acc_bot - manip_mult * a:
+                direction = 1
+        if direction == 0:
+            i += 1
+            continue
+        j = i + 1
+        entry = ao[j] if direction == 1 else bo[j]
+        risk = PO3_SL_ATR * a
+        sl = entry - direction * risk
+        tp = entry + direction * PO3_RR * risk
+        end = min(j + SB_MAX_BARS, n - 1)
+        r, k = None, j
+        for k in range(j, end + 1):
+            if direction == 1:
+                if bl[k] <= sl:
+                    r = -1.0
+                    break
+                if bh[k] >= tp:
+                    r = PO3_RR
+                    break
+            else:
+                if ah[k] >= sl:
+                    r = -1.0
+                    break
+                if al[k] <= tp:
+                    r = PO3_RR
+                    break
+        if r is None:
+            exit_p = bc[k] if direction == 1 else ac[k]
+            r = direction * (exit_p - entry) / risk
+        if t[j] >= start_ts:
+            trades.append({"pair": pair, "entry": t[j], "exit": t[k], "dir": direction, "r": float(r),
+                           "risk_pips": risk / pip(pair), "spread_frac": (ao[j] - bo[j]) / risk})
+        state = 0
+        i = k + 1   # the script only looks for a new setup after the trade has closed
+    return trades
+
+
+def simulate_ob(d, pair, start_ts):
+    t = d["time"].tolist()
+    h, l, c = d["h"].to_numpy(), d["l"].to_numpy(), d["c"].to_numpy()
+    bo, bh, bl, bc = (d[k].to_numpy() for k in ("bo", "bh", "bl", "bc"))
+    ao, ah, al, ac = (d[k].to_numpy() for k in ("ao", "ah", "al", "ac"))
+    atr = calc_atr(d, 10).to_numpy()
+    L = OB_SWING_LEN
+    upper = d["h"].rolling(L).max().to_numpy()
+    lower = d["l"].rolling(L).min().to_numpy()
+    n = len(d)
+    swing_type = 0
+    top = btm = None            # [bar index, price, crossed]
+    bull, bear = [], []         # newest first, like the script
+    pos = {rr: None for rr in OB_RRS}
+    trades = {rr: [] for rr in OB_RRS}
+    skipped = {rr: 0 for rr in OB_RRS}
+
+    def close_trade(rr, p, i, r):
+        if p["record"]:
+            trades[rr].append({"pair": pair, "entry": p["t"], "exit": t[i], "dir": p["dir"], "r": float(r),
+                               "risk_pips": p["risk"] / pip(pair), "spread_frac": p["spread"] / p["risk"]})
+
+    for i in range(n):
+        # 1) manage open trades (one per pair per R:R setting)
+        exited = set()
+        for rr in OB_RRS:
+            p = pos[rr]
+            if p is None or i <= p["fill"]:
+                continue
+            r = None
+            if p["dir"] == 1:
+                if bl[i] <= p["sl"]:
+                    r = -1.0
+                elif bh[i] >= p["tp"]:
+                    r = rr
+            else:
+                if ah[i] >= p["sl"]:
+                    r = -1.0
+                elif al[i] <= p["tp"]:
+                    r = rr
+            if r is None and i - p["fill"] >= SB_MAX_BARS:
+                exit_p = bc[i] if p["dir"] == 1 else ac[i]
+                r = p["dir"] * (exit_p - p["entry"]) / p["risk"]
+            if r is not None:
+                close_trade(rr, p, i, r)
+                pos[rr] = None
+                exited.add(rr)
+
+        # 2) limit entry on the first re-entry into a live zone (zones known before this candle)
+        if i > 0 and not np.isnan(atr[i - 1]):
+            spread = ao[i] - bo[i]
+            for rr in OB_RRS:
+                if pos[rr] is not None or rr in exited:
+                    continue
+                done = False
+                for side, zones in ((1, bull), (-1, bear)):
+                    for z in zones[:OB_ZONES]:
+                        if z["breaker"] or rr in z["traded"] or z["created"] >= i:
+                            continue
+                        if side == 1 and al[i] <= z["top"]:
+                            entry = min(z["top"], ao[i])
+                            sl = z["bottom"] - OB_SL_PAD_ATR * atr[i - 1]
+                        elif side == -1 and bh[i] >= z["bottom"]:
+                            entry = max(z["bottom"], bo[i])
+                            sl = z["top"] + OB_SL_PAD_ATR * atr[i - 1]
+                        else:
+                            continue
+                        z["traded"].add(rr)
+                        risk = side * (entry - sl)
+                        if risk <= 0 or spread > MAX_SPREAD_RISK * risk:
+                            skipped[rr] += 1
+                            continue
+                        p = {"dir": side, "entry": entry, "sl": sl, "tp": entry + side * rr * risk, "risk": risk,
+                             "fill": i, "t": t[i], "spread": spread, "record": t[i] >= start_ts}
+                        stopped = (bl[i] <= sl) if side == 1 else (ah[i] >= sl)
+                        if stopped:   # stopped out on the same candle it filled (assume the worst)
+                            close_trade(rr, p, i, -1.0)
+                        else:
+                            pos[rr] = p
+                        done = True
+                        break
+                    if done:
+                        break
+
+        # 3) the script's zone upkeep: invalidate on a wick through the zone, drop once fully reclaimed
+        for z in list(bull):
+            if not z["breaker"]:
+                if l[i] < z["bottom"]:
+                    z["breaker"] = True
+            elif h[i] > z["top"]:
+                bull.remove(z)
+        for z in list(bear):
+            if not z["breaker"]:
+                if h[i] > z["top"]:
+                    z["breaker"] = True
+            elif l[i] < z["bottom"]:
+                bear.remove(z)
+
+        # 4) swings (confirmed OB_SWING_LEN candles later) and new zones on a close through a swing
+        if i >= L:
+            if h[i - L] > upper[i]:
+                st = 0
+            elif l[i - L] < lower[i]:
+                st = 1
+            else:
+                st = swing_type
+            if st == 0 and swing_type != 0:
+                top = [i - L, h[i - L], False]
+            if st == 1 and swing_type != 1:
+                btm = [i - L, l[i - L], False]
+            swing_type = st
+        if top is not None and c[i] > top[1] and not top[2]:
+            top[2] = True
+            box_btm, box_top = l[i - 1], h[i - 1]
+            for k in range(1, i - top[0]):
+                if l[i - k] <= box_btm:
+                    box_btm, box_top = l[i - k], h[i - k]
+            if box_top - box_btm <= atr[i] * 3.5:
+                bull.insert(0, {"top": box_top, "bottom": box_btm, "breaker": False, "traded": set(), "created": i})
+                del bull[30:]
+        if btm is not None and c[i] < btm[1] and not btm[2]:
+            btm[2] = True
+            box_btm, box_top = l[i - 1], h[i - 1]
+            for k in range(1, i - btm[0]):
+                if h[i - k] >= box_top:
+                    box_top, box_btm = h[i - k], l[i - k]
+            if box_top - box_btm <= atr[i] * 3.5:
+                bear.insert(0, {"top": box_top, "bottom": box_btm, "breaker": False, "traded": set(), "created": i})
+                del bear[30:]
+
+    for rr in OB_RRS:   # anything still open at the end is closed at the last price
+        p = pos[rr]
+        if p is not None:
+            exit_p = bc[n - 1] if p["dir"] == 1 else ac[n - 1]
+            close_trade(rr, p, n - 1, p["dir"] * (exit_p - p["entry"]) / p["risk"])
+    return trades, skipped
+
+
+def run_backtest_flux(api, days):
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+    start_ts = pd.Timestamp(start)
+    log.info(f"BACKTEST | Flux Charts: Power Of Three ({PO3_MODE}) + Order Blocks (re-entry, R:R {OB_RRS}) | "
+             f"{TIMEFRAME} | last {days} days | {len(PAIRS)} pairs")
+    po3_all, ob_all, ob_skip = [], {rr: [] for rr in OB_RRS}, {rr: 0 for rr in OB_RRS}
+    for pair in PAIRS:
+        try:
+            sig = fetch_range(api, pair, TIMEFRAME, start - timedelta(days=10))
+            if len(sig) < 300:
+                log.info(f"{pair} | not enough history, skipped")
+                continue
+            p3 = simulate_po3(sig, pair, start_ts)
+            obt, obs = simulate_ob(sig, pair, start_ts)
+            po3_all += p3
+            for rr in OB_RRS:
+                ob_all[rr] += obt[rr]
+                ob_skip[rr] += obs[rr]
+            log.info(f"{pair} | done | PO3 {len(p3)} trades | OB {len(obt[OB_RRS[0]])} trades")
+        except Exception as e:
+            log.error(f"{pair} | BACKTEST ERROR | {e}")
+
+    def line(label, tr):
+        s = stats(tr)
+        ordered = sorted(tr, key=lambda x: x["entry"])
+        h2 = len(ordered) // 2
+        a1, a2 = stats(ordered[:h2])["avg"], stats(ordered[h2:])["avg"]
+        return f"{label:<7}{s['n']:>5}{s['win']:>5.0f}%{s['avg']:>6.2f}{s['pf']:>5.2f}{a1:>6.2f}{a2:>6.2f}"
+
+    log.info("")
+    log.info(f"===== FLUX CHARTS | {TIMEFRAME} | last {days} days | results in R =====")
+    log.info(f"{'':<7}{'n':>5}{'win':>6}{'avgR':>6}{'PF':>5}{'1st':>6}{'2nd':>6}")
+    log.info(line("PO3", po3_all))
+    for rr in OB_RRS:
+        log.info(line(f"OB 1:{rr:g}", ob_all[rr]))
+    log.info("1st/2nd = average R in the older/newer half of the period.")
+    if po3_all:
+        log.info(f"PO3: average stop {np.mean([x['risk_pips'] for x in po3_all]):.1f} pips, spread "
+                 f"{np.mean([x['spread_frac'] for x in po3_all]) * 100:.0f}% of risk. "
+                 f"It targets {PO3_RR:g}R per 1R risked, so it needs {100 / (1 + PO3_RR):.0f}%+ wins to break even.")
+    first = ob_all[OB_RRS[0]]
+    if first:
+        log.info(f"OB: average stop {np.mean([x['risk_pips'] for x in first]):.1f} pips, spread "
+                 f"{np.mean([x['spread_frac'] for x in first]) * 100:.0f}% of risk. "
+                 f"Skipped (spread over {MAX_SPREAD_RISK * 100:.0f}% of risk): {ob_skip[OB_RRS[0]]}.")
+    log.info("Need: avgR above 0 in BOTH halves, PF above 1.2, a few hundred trades.")
+    log.info("Not modelled: slippage, swap fees, news gaps.")
+    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+
+
+# ----------------------------------------------------------------------------
 # LIVE
 # ----------------------------------------------------------------------------
 def place_order(api, pair, direction, sl, tp=None):
@@ -938,8 +1217,11 @@ def main():
     api = Oanda()
     if mode == "backtest":
         days = int(sys.argv[2]) if len(sys.argv) > 2 else _i("BACKTEST_DAYS", 90)
-        if os.getenv("BACKTEST_STRATEGY", "ut").lower() == "srbb":
+        strategy = os.getenv("BACKTEST_STRATEGY", "ut").lower()
+        if strategy == "srbb":
             run_backtest_srbb(api, days)
+        elif strategy == "flux":
+            run_backtest_flux(api, days)
         else:
             run_backtest(api, days)
         while True:  # idle so Railway does not keep re-running it
