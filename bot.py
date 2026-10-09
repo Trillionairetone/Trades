@@ -6,10 +6,12 @@ Filters: ADX (no ranges), Bollinger squeeze, tick volume, H1 trend (EMA50/EMA200
          daily support/resistance, spread vs risk
 Risk   : stop = ATR x multiplier (with a minimum), take profit = 3 x risk (1:3)
 Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
+Exits  : backtest compares a fixed 1:3 target against "flip" (exit when UT Bot signals the other way)
 
 Run:      python bot.py
-Backtest: set Railway variable MODE=backtest (optionally BACKTEST_DAYS=90) and redeploy,
-          or run: python bot.py backtest 90
+Backtest: set Railway variable MODE=backtest (optionally BACKTEST_DAYS=180 and
+          BACKTEST_KEYS=1,2,3 to compare UT Bot sensitivities) and redeploy,
+          or run: python bot.py backtest 180
 """
 import logging
 import os
@@ -62,7 +64,8 @@ VOL_MIN_RATIO = _f("VOL_MIN_RATIO", 0.5)     # signal candle volume vs 20-bar av
 SR_BUFFER_R = _f("SR_BUFFER_R", 1.0)         # block if opposing daily level is within this many R
 MAX_SPREAD_RISK = _f("MAX_SPREAD_RISK", 0.25)  # skip if spread > this share of risk
 
-MAX_BARS_HELD = _i("MAX_BARS_HELD", 96)      # backtest only: close trade after 24h
+MAX_BARS_HELD = _i("MAX_BARS_HELD", 96)      # backtest only: close fixed-target trades after 24h
+FLIP_MAX_BARS = _i("FLIP_MAX_BARS", 960)     # backtest only: longest a flip-exit trade can run (10 days)
 STALE_SECONDS = _i("STALE_SECONDS", 300)     # ignore signals older than this (live)
 
 
@@ -108,7 +111,7 @@ class Oanda:
                 r = self.s.get(self.base + path, params=params, timeout=30)
                 if r.status_code == 200:
                     return r.json()
-                if r.status_code in (429, 500, 502, 503, 504):
+                if r.status_code in (401, 429, 500, 502, 503, 504):
                     last = f"HTTP {r.status_code}"
                     time.sleep(2 ** attempt)
                     continue
@@ -242,9 +245,9 @@ def ut_bot(df, key, period):
     return stop, buy, sell
 
 
-def prepare(m15):
+def prepare(m15, key=None):
     d = m15.copy()
-    d["ut_stop"], d["ut_buy"], d["ut_sell"] = ut_bot(d, UT_KEY, UT_ATR)
+    d["ut_stop"], d["ut_buy"], d["ut_sell"] = ut_bot(d, UT_KEY if key is None else key, UT_ATR)
     d["atr"] = calc_atr(d, ATR_PERIOD)
     d["adx"] = calc_adx(d, 14)
     mid = d["c"].rolling(20).mean()
@@ -330,7 +333,8 @@ def trend_label(row):
 # ----------------------------------------------------------------------------
 # BACKTEST
 # ----------------------------------------------------------------------------
-def simulate(d, pair, daily, start_ts, use_filters):
+def simulate(d, pair, daily, start_ts, use_filters, exit_mode="fixed"):
+    """exit_mode "fixed": stop + 1:RR target.  "flip": stop + exit when UT Bot signals the other way."""
     times = d["time"].tolist()
     bo, bh, bl, bc = (d[c].to_numpy() for c in ("bo", "bh", "bl", "bc"))
     ao, ah, al, ac = (d[c].to_numpy() for c in ("ao", "ah", "al", "ac"))
@@ -359,30 +363,53 @@ def simulate(d, pair, daily, start_ts, use_filters):
             skipped[reason] = skipped.get(reason, 0) + 1
             continue
         sl = entry - direction * risk
-        tp = entry + direction * RR * risk
-        end = min(j + MAX_BARS_HELD, n - 1)
         r = None
+        flipped = False
         k = j
-        for k in range(j, end + 1):
-            if direction == 1:  # long exits at the bid
-                if bl[k] <= sl:
-                    r = -1.0
-                    break
-                if bh[k] >= tp:
-                    r = RR
-                    break
-            else:  # short exits at the ask
-                if ah[k] >= sl:
-                    r = -1.0
-                    break
-                if al[k] <= tp:
-                    r = RR
-                    break
+        if exit_mode == "flip":
+            end = min(j + FLIP_MAX_BARS, n - 1)
+            for k in range(j, end + 1):
+                if direction == 1:  # long exits at the bid
+                    if bl[k] <= sl:
+                        r = -1.0
+                        break
+                    if usell[k] and k + 1 <= n - 1:
+                        r = (bo[k + 1] - entry) / risk
+                        flipped = True
+                        break
+                else:  # short exits at the ask
+                    if ah[k] >= sl:
+                        r = -1.0
+                        break
+                    if ubuy[k] and k + 1 <= n - 1:
+                        r = (entry - ao[k + 1]) / risk
+                        flipped = True
+                        break
+        else:
+            tp = entry + direction * RR * risk
+            end = min(j + MAX_BARS_HELD, n - 1)
+            for k in range(j, end + 1):
+                if direction == 1:
+                    if bl[k] <= sl:
+                        r = -1.0
+                        break
+                    if bh[k] >= tp:
+                        r = RR
+                        break
+                else:
+                    if ah[k] >= sl:
+                        r = -1.0
+                        break
+                    if al[k] <= tp:
+                        r = RR
+                        break
         if r is None:
             exit_p = bc[k] if direction == 1 else ac[k]
             r = direction * (exit_p - entry) / risk
-        busy = k
-        trades.append({"pair": pair, "entry": times[j], "exit": times[k], "dir": direction, "r": float(r)})
+        # a flip exit happens on the signal candle, so that same signal may open the reverse trade
+        busy = k - 1 if flipped else k
+        exit_t = times[k + 1] if flipped else times[k]
+        trades.append({"pair": pair, "entry": times[j], "exit": exit_t, "dir": direction, "r": float(r)})
     return trades, skipped
 
 
@@ -413,13 +440,21 @@ def stat_line(label, trades):
     )
 
 
+BT_CONFIGS = [
+    ("fixed UT", False, "fixed"),
+    ("fixed UT+", True, "fixed"),
+    ("flip UT", False, "flip"),
+    ("flip UT+", True, "flip"),
+]
+
+
 def run_backtest(api, days):
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=days)
     start_ts = pd.Timestamp(start)
-    log.info(f"BACKTEST | last {days} days | {len(PAIRS)} pairs | fetching OANDA history...")
-    base_all, plus_all, skip_all = [], [], {}
-    per_pair = []
+    keys = [float(x) for x in os.getenv("BACKTEST_KEYS", "").split(",") if x.strip()] or [UT_KEY]
+    log.info(f"BACKTEST | last {days} days | {len(PAIRS)} pairs | UT_KEY values {keys} | fetching OANDA history...")
+    data = {}
     for pair in PAIRS:
         try:
             m15 = fetch_range(api, pair, "M15", start - timedelta(days=5))
@@ -428,36 +463,52 @@ def run_backtest(api, days):
             if len(m15) < 300 or len(h1) < 250:
                 log.info(f"{pair} | not enough history, skipped")
                 continue
-            d = add_htf_trend(prepare(m15), h1)
-            base, _ = simulate(d, pair, dly, start_ts, use_filters=False)
-            plus, sk = simulate(d, pair, dly, start_ts, use_filters=True)
-            base_all += base
-            plus_all += plus
-            for k, v in sk.items():
-                skip_all[k] = skip_all.get(k, 0) + v
-            per_pair.append((pair, stats(base), stats(plus)))
-            log.info(f"{pair} | done | baseline {len(base)} trades | UT+ {len(plus)} trades")
+            data[pair] = (m15, h1, dly)
+            log.info(f"{pair} | history loaded | {len(m15)} M15 candles")
         except Exception as e:
             log.error(f"{pair} | BACKTEST ERROR | {e}")
 
+    for key in keys:
+        results = {name: [] for name, _, _ in BT_CONFIGS}
+        skip_plus = {}
+        per_pair = []
+        for pair, (m15, h1, dly) in data.items():
+            try:
+                d = add_htf_trend(prepare(m15, key), h1)
+                row = {}
+                for name, use_f, mode in BT_CONFIGS:
+                    tr, sk = simulate(d, pair, dly, start_ts, use_f, mode)
+                    results[name] += tr
+                    row[name] = stats(tr)
+                    if name == "fixed UT+":
+                        for k2, v in sk.items():
+                            skip_plus[k2] = skip_plus.get(k2, 0) + v
+                per_pair.append((pair, row))
+            except Exception as e:
+                log.error(f"{pair} | BACKTEST ERROR | {e}")
+
+        log.info("")
+        log.info(f"===== BACKTEST | UT_KEY {key:g} | last {days} days | results in R (multiples of risk) =====")
+        log.info(f"{'':<18}{'trades':>6}{'win%':>9}{'avgR':>8}{'totalR':>9}{'PF':>7}{'maxDD':>9}")
+        for name, _, _ in BT_CONFIGS:
+            log.info(stat_line(name, results[name]))
+        ordered = sorted(results["flip UT+"], key=lambda t: t["entry"])
+        half = len(ordered) // 2
+        log.info(stat_line("flip UT+ 1st half", ordered[:half]))
+        log.info(stat_line("flip UT+ 2nd half", ordered[half:]))
+        log.info("Blocked by UT+ filters: " + (", ".join(f"{k2} {v}" for k2, v in sorted(skip_plus.items(), key=lambda x: -x[1])) or "none"))
+        if len(keys) == 1:
+            log.info("")
+            log.info(f"{'pair':<10}{'fixed UT+ R':>13}{'flip UT R':>12}{'flip UT+ R':>13}{'flip UT+ n':>12}")
+            for pair, row in per_pair:
+                log.info(
+                    f"{pair:<10}{row['fixed UT+']['total']:>13.1f}{row['flip UT']['total']:>12.1f}"
+                    f"{row['flip UT+']['total']:>13.1f}{row['flip UT+']['n']:>12}"
+                )
+
     log.info("")
-    log.info(f"===== BACKTEST RESULTS (last {days} days, all results in R = multiples of risk) =====")
-    log.info(f"{'':<18}{'trades':>6}{'win%':>9}{'avgR':>8}{'totalR':>9}{'PF':>7}{'maxDD':>9}")
-    log.info(stat_line("UT baseline", base_all))
-    log.info(stat_line("UT+ (filters)", plus_all))
-    ordered = sorted(plus_all, key=lambda t: t["entry"])
-    half = len(ordered) // 2
-    log.info(stat_line("UT+ 1st half", ordered[:half]))
-    log.info(stat_line("UT+ 2nd half", ordered[half:]))
-    log.info("")
-    log.info("Signals blocked by UT+ filters: " + (", ".join(f"{k} {v}" for k, v in sorted(skip_all.items(), key=lambda x: -x[1])) or "none"))
-    log.info("")
-    log.info(f"{'pair':<10}{'base n':>8}{'base R':>9}{'UT+ n':>8}{'UT+ R':>9}")
-    for pair, b, p in per_pair:
-        log.info(f"{pair:<10}{b['n']:>8}{b['total']:>9.1f}{p['n']:>8}{p['total']:>9.1f}")
-    log.info("")
-    be = 100.0 / (1.0 + RR)
-    log.info(f"Break-even win rate at 1:{RR:g} is {be:.0f}%. Look for: positive avgR in BOTH halves, PF above 1.2, enough trades (50+).")
+    log.info(f"fixed exit: break-even win rate is {100.0 / (1.0 + RR):.0f}% at 1:{RR:g}. flip exit: just needs avgR above 0.")
+    log.info("Look for: avgR above 0 in BOTH halves, PF above 1.2, 100+ trades, and a similar result across neighbouring UT_KEY values (one lucky setting is probably noise).")
     log.info("Backtests ignore slippage, swap fees and news gaps. Treat them as a sanity check, not a promise.")
     log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
 
