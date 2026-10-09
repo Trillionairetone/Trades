@@ -74,7 +74,7 @@ SR_BUFFER_R = _f("SR_BUFFER_R", 1.0)         # block if opposing daily level is 
 MAX_SPREAD_RISK = _f("MAX_SPREAD_RISK", 0.25)  # skip if spread > this share of risk
 
 MAX_BARS_HELD = _i("MAX_BARS_HELD", 96)      # backtest only: close fixed-target trades after 24h
-FLIP_MAX_BARS = _i("FLIP_MAX_BARS", {"M15": 2880, "H1": 960, "H4": 240}.get(os.getenv("TIMEFRAME", "M15").upper(), 960))  # backtest only: ~30-40 days
+FLIP_MAX_BARS = _i("FLIP_MAX_BARS", {"M15": 2880, "M30": 1440, "H1": 960, "H4": 240}.get(os.getenv("TIMEFRAME", "M15").upper(), 960))  # backtest only: ~30-40 days
 SR_TP_BUFFER_ATR = _f("SR_TP_BUFFER_ATR", 0.25)  # "sr" exit: take profit this many ATR before the level (the zone edge)
 SR_MIN_R = _f("SR_MIN_R", 1.0)               # "sr" exit: ignore levels closer than this many R
 SR_MAX_R = _f("SR_MAX_R", 6.0)               # "sr" exit: levels farther than this are ignored (trade just rides to the flip)
@@ -82,11 +82,11 @@ STALE_SECONDS = _i("STALE_SECONDS", 300)     # ignore signals older than this (l
 
 
 TIMEFRAME = os.getenv("TIMEFRAME", "M15").upper()
-TF_MIN = {"M15": 15, "H1": 60, "H4": 240}            # candle length in minutes
-HTF_OF = {"M15": "H1", "H1": "H4", "H4": "D"}        # trend-filter timeframe
+TF_MIN = {"M15": 15, "M30": 30, "H1": 60, "H4": 240}            # candle length in minutes
+HTF_OF = {"M15": "H1", "M30": "H4", "H1": "H4", "H4": "D"}        # trend-filter timeframe
 HTF_MIN = {"H1": 60, "H4": 240, "D": 1440}
-SIG_WARMUP = {"M15": 5, "H1": 15, "H4": 40}          # backtest: extra days of history for indicators
-HTF_WARMUP = {"M15": 25, "H1": 70, "H4": 320}        # backtest: extra days for the trend EMAs
+SIG_WARMUP = {"M15": 5, "M30": 8, "H1": 15, "H4": 40}          # backtest: extra days of history for indicators
+HTF_WARMUP = {"M15": 25, "M30": 70, "H1": 70, "H4": 320}        # backtest: extra days for the trend EMAs
 if TIMEFRAME not in TF_MIN:
     raise RuntimeError(f"TIMEFRAME must be one of {list(TF_MIN)}, got {TIMEFRAME!r}")
 HTF = HTF_OF[TIMEFRAME]
