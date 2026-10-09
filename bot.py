@@ -1,344 +1,589 @@
 """
-OANDA Practice trading bot - M15 strategy with daily S/R, Bollinger Bands(20,2),
-volume and candlestick confirmation. SL/TP at 1:3 risk-reward, fixed size.
+UT+ bot for OANDA  (bot.py)
 
-Settings are read from environment variables (no code editing needed):
-  OANDA_TOKEN       (required) your API token
-  OANDA_ACCOUNT_ID  (required) e.g. 101-001-1234567-001
-Optional:
-  UNITS             fallback size in units if risk-based sizing fails (default 1000)
-  RISK_PCT          % of balance risked per trade (default 0.5)
-  MAX_UNITS         hard cap on trade size (default 50000)
-  MAX_PER_CURRENCY  max net same-direction trades per currency (default 2)
-  MAX_RISK_ATR      skip if stop is wider than this many ATRs (default 2.5)
-  MAX_SPREAD_FRAC   skip if spread is more than this share of the risk (default 0.2)
-  VOL_FACTOR        candle volume must beat this share of the 20-candle average (default 0.8)
-  MAX_POSITIONS     max open trades at once (default 5)
-  PAIRS             comma list (default major pairs)
+Signal : UT Bot style ATR trailing stop flip on M15 (same maths as the TradingView script)
+Filters: ADX (no ranges), Bollinger squeeze, tick volume, H1 trend (EMA50/EMA200),
+         daily support/resistance, spread vs risk
+Risk   : stop = ATR x multiplier (with a minimum), take profit = 3 x risk (1:3)
+Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
+
+Run:      python bot.py
+Backtest: set Railway variable MODE=backtest (optionally BACKTEST_DAYS=90) and redeploy,
+          or run: python bot.py backtest 90
 """
+import logging
 import os
 import sys
 import time
-import datetime as dt
+from datetime import datetime, timedelta, timezone
+
+import numpy as np
+import pandas as pd
 import requests
 
-BASE = "https://api-fxpractice.oanda.com"  # PRACTICE ONLY
-TOKEN = "".join(os.environ.get("OANDA_TOKEN", "").split())
-ACCOUNT = "".join(os.environ.get("OANDA_ACCOUNT_ID", "").split())
-UNITS = int(os.environ.get("UNITS", "1000"))
-MAX_POSITIONS = int(os.environ.get("MAX_POSITIONS", "5"))
-PAIRS = os.environ.get(
-    "PAIRS",
-    "EUR_USD,GBP_USD,USD_JPY,AUD_USD,USD_CAD,USD_CHF,NZD_USD,EUR_JPY,GBP_JPY",
-).split(",")
-RR = 3.0
-RISK_PCT = float(os.environ.get("RISK_PCT", "0.5"))
-MAX_UNITS = int(os.environ.get("MAX_UNITS", "50000"))
-MAX_PER_CURRENCY = int(os.environ.get("MAX_PER_CURRENCY", "2"))
-MAX_RISK_ATR = float(os.environ.get("MAX_RISK_ATR", "2.5"))
-MAX_SPREAD_FRAC = float(os.environ.get("MAX_SPREAD_FRAC", "0.2"))
-VOL_FACTOR = float(os.environ.get("VOL_FACTOR", "0.8"))
-
-if not TOKEN or not ACCOUNT:
-    sys.exit("Missing OANDA_TOKEN or OANDA_ACCOUNT_ID environment variables.")
-
-HEAD = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
+logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
+log = logging.getLogger("bot")
 
 
-def api(method, path, **kw):
-    r = requests.request(method, BASE + path, headers=HEAD, timeout=20, **kw)
-    if r.status_code >= 400:
-        raise RuntimeError(f"{r.status_code} {r.text[:300]}")
-    return r.json()
+# ----------------------------------------------------------------------------
+# CONFIG (every value can be overridden with a Railway variable of the same name)
+# ----------------------------------------------------------------------------
+def _f(name, default):
+    return float(os.getenv(name, default))
 
 
-def candles(pair, gran, count):
-    d = api("GET", f"/v3/instruments/{pair}/candles",
-            params={"granularity": gran, "count": count, "price": "M"})
-    out = []
-    for c in d["candles"]:
-        if c["complete"]:
-            m = c["mid"]
-            out.append({"o": float(m["o"]), "h": float(m["h"]),
-                        "l": float(m["l"]), "c": float(m["c"]),
-                        "v": c["volume"]})
+def _i(name, default):
+    return int(float(os.getenv(name, default)))
+
+
+PAIRS = [
+    p.strip().upper()
+    for p in os.getenv(
+        "PAIRS",
+        "EUR_USD,GBP_USD,USD_JPY,AUD_USD,USD_CAD,USD_CHF,NZD_USD,EUR_GBP,EUR_JPY",
+    ).split(",")
+    if p.strip()
+]
+
+UNITS = _i("UNITS", 1000)                    # fixed size per trade (1000 = 0.01 lot)
+MAX_OPEN_TRADES = _i("MAX_OPEN_TRADES", 20)  # one trade per pair, this caps the total
+
+UT_KEY = _f("UT_KEY", 1.0)                   # UT Bot "key value" (sensitivity)
+UT_ATR = _i("UT_ATR", 10)                    # UT Bot ATR period
+
+ATR_PERIOD = _i("ATR_PERIOD", 14)            # ATR used for stop distance
+SL_ATR_MULT = _f("SL_ATR_MULT", 1.5)         # stop = ATR x this
+MIN_STOP_PIPS = _f("MIN_STOP_PIPS", 8)       # never use a stop tighter than this
+RR = _f("RR", 3.0)                           # take profit = RR x risk
+
+ADX_MIN = _f("ADX_MIN", 20)                  # below this = ranging, no trade
+SQUEEZE_PCT = _f("SQUEEZE_PCT", 0.20)        # Bollinger width in bottom 20% of last 100 bars = squeeze
+VOL_MIN_RATIO = _f("VOL_MIN_RATIO", 0.5)     # signal candle volume vs 20-bar average
+SR_BUFFER_R = _f("SR_BUFFER_R", 1.0)         # block if opposing daily level is within this many R
+MAX_SPREAD_RISK = _f("MAX_SPREAD_RISK", 0.25)  # skip if spread > this share of risk
+
+MAX_BARS_HELD = _i("MAX_BARS_HELD", 96)      # backtest only: close trade after 24h
+STALE_SECONDS = _i("STALE_SECONDS", 300)     # ignore signals older than this (live)
+
+
+def pip(pair):
+    return 0.01 if "JPY" in pair else 0.0001
+
+
+def fmt_price(pair, p):
+    return f"{p:.3f}" if "JPY" in pair else f"{p:.5f}"
+
+
+# ----------------------------------------------------------------------------
+# OANDA API
+# ----------------------------------------------------------------------------
+def _first_env(names):
+    for n in names:
+        v = os.getenv(n)
+        if v:
+            return v.strip()
+    return None
+
+
+class Oanda:
+    def __init__(self):
+        token = _first_env(["OANDA_API_KEY", "OANDA_API_TOKEN", "OANDA_TOKEN", "OANDA_ACCESS_TOKEN"])
+        account = _first_env(["OANDA_ACCOUNT_ID", "OANDA_ACCOUNT"])
+        if not token or not account:
+            raise RuntimeError(
+                "Missing OANDA token or account id. Set OANDA_API_KEY and OANDA_ACCOUNT_ID in Railway variables."
+            )
+        env = os.getenv("OANDA_ENV", "practice").lower()
+        self.base = (
+            "https://api-fxtrade.oanda.com" if env == "live" else "https://api-fxpractice.oanda.com"
+        )
+        self.account = account
+        self.s = requests.Session()
+        self.s.headers.update({"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+
+    def get(self, path, params=None):
+        last = None
+        for attempt in range(4):
+            try:
+                r = self.s.get(self.base + path, params=params, timeout=30)
+                if r.status_code == 200:
+                    return r.json()
+                if r.status_code in (429, 500, 502, 503, 504):
+                    last = f"HTTP {r.status_code}"
+                    time.sleep(2 ** attempt)
+                    continue
+                raise RuntimeError(f"GET {path} -> {r.status_code}: {r.text[:300]}")
+            except requests.RequestException as e:
+                last = str(e)
+                time.sleep(2 ** attempt)
+        raise RuntimeError(f"GET {path} failed after retries: {last}")
+
+    def post(self, path, body):
+        # no retries on purpose, so an order can never be sent twice
+        r = self.s.post(self.base + path, json=body, timeout=30)
+        try:
+            return r.status_code, r.json()
+        except ValueError:
+            return r.status_code, {"raw": r.text[:300]}
+
+
+def parse_candles(raw):
+    rows = []
+    for c in raw:
+        if not c.get("complete", False):
+            continue
+        rows.append(
+            {
+                "time": c["time"],
+                "volume": c["volume"],
+                "o": float(c["mid"]["o"]), "h": float(c["mid"]["h"]),
+                "l": float(c["mid"]["l"]), "c": float(c["mid"]["c"]),
+                "bo": float(c["bid"]["o"]), "bh": float(c["bid"]["h"]),
+                "bl": float(c["bid"]["l"]), "bc": float(c["bid"]["c"]),
+                "ao": float(c["ask"]["o"]), "ah": float(c["ask"]["h"]),
+                "al": float(c["ask"]["l"]), "ac": float(c["ask"]["c"]),
+            }
+        )
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    df = df.drop_duplicates("time").sort_values("time").reset_index(drop=True)
+    return df
+
+
+def fetch_recent(api, pair, gran, count):
+    data = api.get(
+        f"/v3/instruments/{pair}/candles",
+        {"granularity": gran, "price": "BAM", "count": count},
+    )
+    return parse_candles(data.get("candles", []))
+
+
+def fetch_range(api, pair, gran, start):
+    raw_all = []
+    cur = start
+    while True:
+        data = api.get(
+            f"/v3/instruments/{pair}/candles",
+            {
+                "granularity": gran,
+                "price": "BAM",
+                "from": cur.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "count": 5000,
+            },
+        )
+        raw = data.get("candles", [])
+        if not raw:
+            break
+        raw_all.extend(raw)
+        if len(raw) < 5000:
+            break
+        cur = pd.Timestamp(raw[-1]["time"]).to_pydatetime() + timedelta(seconds=1)
+        time.sleep(0.2)
+    return parse_candles(raw_all)
+
+
+def get_prices(api):
+    data = api.get(f"/v3/accounts/{api.account}/pricing", {"instruments": ",".join(PAIRS)})
+    out = {}
+    for p in data.get("prices", []):
+        if not p.get("tradeable", True):
+            continue
+        if p.get("bids") and p.get("asks"):
+            out[p["instrument"]] = (float(p["bids"][0]["price"]), float(p["asks"][0]["price"]))
     return out
 
 
-def sma(x, n):
-    return sum(x[-n:]) / n
+# ----------------------------------------------------------------------------
+# INDICATORS
+# ----------------------------------------------------------------------------
+def calc_atr(df, n):
+    pc = df["c"].shift(1)
+    tr = pd.concat(
+        [df["h"] - df["l"], (df["h"] - pc).abs(), (df["l"] - pc).abs()], axis=1
+    ).max(axis=1)
+    return tr.ewm(alpha=1.0 / n, adjust=False).mean()  # Wilder smoothing (same as TradingView RMA)
 
 
-def ema(x, n):
-    k = 2 / (n + 1)
-    e = sum(x[:n]) / n
-    for v in x[n:]:
-        e = v * k + e * (1 - k)
-    return e
+def calc_adx(df, n=14):
+    up = df["h"].diff()
+    dn = -df["l"].diff()
+    plus = pd.Series(np.where((up > dn) & (up > 0), up, 0.0), index=df.index)
+    minus = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=df.index)
+    atr = calc_atr(df, n)
+    pdi = 100 * plus.ewm(alpha=1.0 / n, adjust=False).mean() / atr
+    mdi = 100 * minus.ewm(alpha=1.0 / n, adjust=False).mean() / atr
+    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    return dx.ewm(alpha=1.0 / n, adjust=False).mean()
 
 
-def atr(cs, n=14):
-    trs = [max(c["h"] - c["l"], abs(c["h"] - p["c"]), abs(c["l"] - p["c"]))
-           for p, c in zip(cs[:-1], cs[1:])]
-    return sum(trs[-n:]) / n
+def ut_bot(df, key, period):
+    """UT Bot Alerts: ATR trailing stop, buy/sell when price crosses it."""
+    src = df["c"].to_numpy()
+    atr = calc_atr(df, period).to_numpy()
+    n = len(src)
+    stop = np.zeros(n)
+    buy = np.zeros(n, dtype=bool)
+    sell = np.zeros(n, dtype=bool)
+    for i in range(1, n):
+        loss = key * atr[i]
+        prev = stop[i - 1]
+        if src[i] > prev and src[i - 1] > prev:
+            stop[i] = max(prev, src[i] - loss)
+        elif src[i] < prev and src[i - 1] < prev:
+            stop[i] = min(prev, src[i] + loss)
+        elif src[i] > prev:
+            stop[i] = src[i] - loss
+        else:
+            stop[i] = src[i] + loss
+        buy[i] = src[i] > stop[i] and src[i - 1] <= prev
+        sell[i] = src[i] < stop[i] and src[i - 1] >= prev
+    return stop, buy, sell
 
 
-def bollinger(closes, n=20, k=2):
-    w = closes[-n:]
-    m = sum(w) / n
-    sd = (sum((v - m) ** 2 for v in w) / n) ** 0.5
-    return m - k * sd, m, m + k * sd
+def prepare(m15):
+    d = m15.copy()
+    d["ut_stop"], d["ut_buy"], d["ut_sell"] = ut_bot(d, UT_KEY, UT_ATR)
+    d["atr"] = calc_atr(d, ATR_PERIOD)
+    d["adx"] = calc_adx(d, 14)
+    mid = d["c"].rolling(20).mean()
+    sd = d["c"].rolling(20).std(ddof=0)
+    d["bw"] = (4 * sd) / mid
+    d["bw_cut"] = d["bw"].rolling(100).quantile(SQUEEZE_PCT)
+    d["vol_ratio"] = d["volume"] / d["volume"].rolling(20).mean()
+    d["close_time"] = d["time"] + pd.Timedelta(minutes=15)
+    return d
 
 
-def bullish_candle(p, c):
-    body = abs(c["c"] - c["o"])
-    rng = (c["h"] - c["l"]) or 1e-9
-    lower = min(c["o"], c["c"]) - c["l"]
-    engulf = (c["c"] > c["o"] and p["c"] < p["o"]
-              and c["c"] >= p["o"] and c["o"] <= p["c"])
-    hammer = c["c"] > c["o"] and lower >= 2 * body and body / rng > 0.1
-    return engulf or hammer
+def add_htf_trend(d, h1):
+    """Attach the H1 trend (1 up, -1 down, 0 unknown) using only COMPLETED H1 candles."""
+    h = h1.copy().reset_index(drop=True)
+    h["ema50"] = h["c"].ewm(span=50, adjust=False).mean()
+    h["ema200"] = h["c"].ewm(span=200, adjust=False).mean()
+    h["htf"] = np.where(h["ema50"] > h["ema200"], 1, -1)
+    h.loc[h.index < 200, "htf"] = 0  # not enough history yet
+    h["avail"] = h["time"] + pd.Timedelta(hours=1)
+    m = pd.merge_asof(
+        d.sort_values("close_time"),
+        h[["avail", "htf"]].sort_values("avail"),
+        left_on="close_time",
+        right_on="avail",
+        direction="backward",
+    )
+    m["htf"] = m["htf"].fillna(0).astype(int)
+    return m.reset_index(drop=True)
 
 
-def bearish_candle(p, c):
-    body = abs(c["c"] - c["o"])
-    rng = (c["h"] - c["l"]) or 1e-9
-    upper = c["h"] - max(c["o"], c["c"])
-    engulf = (c["c"] < c["o"] and p["c"] > p["o"]
-              and c["c"] <= p["o"] and c["o"] >= p["c"])
-    star = c["c"] < c["o"] and upper >= 2 * body and body / rng > 0.1
-    return engulf or star
+def sr_levels(daily, as_of, lookback=90):
+    """Confirmed daily swing highs (resistance) and lows (support) known at time `as_of`."""
+    if daily is None or daily.empty:
+        return [], []
+    d = daily[daily["time"] + pd.Timedelta(days=1) <= as_of].tail(lookback).reset_index(drop=True)
+    h = d["h"].to_numpy()
+    l = d["l"].to_numpy()
+    res, sup = [], []
+    for i in range(2, len(d) - 2):
+        if h[i] >= h[i - 2:i + 3].max():
+            res.append(h[i])
+        if l[i] <= l[i - 2:i + 3].min():
+            sup.append(l[i])
+    return res, sup
 
 
-def analyse(pair):
-    m15 = candles(pair, "M15", 250)
-    daily = candles(pair, "D", 30)
-    if len(m15) < 210 or len(daily) < 12:
-        return None
-    closes = [c["c"] for c in m15]
-    last, prev = m15[-1], m15[-2]
-    price = last["c"]
-    a = atr(m15)
-
-    # Daily support / resistance: previous day and 10-day extremes
-    supports = [daily[-1]["l"], min(c["l"] for c in daily[-10:])]
-    resists = [daily[-1]["h"], max(c["h"] for c in daily[-10:])]
-
-    # M15 trend
-    e50, e200 = ema(closes, 50), ema(closes, 200)
-    e50_prev = ema(closes[:-8], 50)
-    if price > e50 > e200 and e50 > e50_prev:
-        trend = "Bullish"
-    elif price < e50 < e200 and e50 < e50_prev:
-        trend = "Bearish"
-    else:
-        trend = "Sideways"
-
-    lower, mid, upper = bollinger(closes)
-    vol_ok = last["v"] > VOL_FACTOR * sma([c["v"] for c in m15[-21:-1]], 20)
-    zone = 1.0 * a  # "near" a level
-
-    signal = "NO TRADE"
-    sl = tp = None
-    blocked = []  # which filters stopped this pair (for the log)
-    if trend == "Sideways":
-        blocked.append("trend")
-    elif trend == "Bullish":
-        near_sup = any(abs(last["l"] - s) <= zone or last["l"] < s for s in supports)
-        touched = min(last["l"], prev["l"]) <= lower * 1.0 + 0.2 * a
-        level_ok = (near_sup or touched) and price > lower
-        if not vol_ok:
-            blocked.append("volume")
-        if not bullish_candle(prev, last):
-            blocked.append("candle")
-        if not level_ok:
-            blocked.append("level/BB")
-        if not blocked:
-            sl = min(last["l"], prev["l"]) - 0.3 * a
-            risk = price - sl
-            if risk > 0:
-                signal, tp = "BUY", price + RR * risk
-    else:  # Bearish
-        near_res = any(abs(last["h"] - r) <= zone or last["h"] > r for r in resists)
-        touched = max(last["h"], prev["h"]) >= upper - 0.2 * a
-        level_ok = (near_res or touched) and price < upper
-        if not vol_ok:
-            blocked.append("volume")
-        if not bearish_candle(prev, last):
-            blocked.append("candle")
-        if not level_ok:
-            blocked.append("level/BB")
-        if not blocked:
-            sl = max(last["h"], prev["h"]) + 0.3 * a
-            risk = sl - price
-            if risk > 0:
-                signal, tp = "SELL", price - RR * risk
-
-    return {"pair": pair, "trend": trend, "signal": signal, "entry": price,
-            "sl": sl, "tp": tp, "atr": a, "blocked": blocked}
+def calc_risk(pair, atr):
+    return max(SL_ATR_MULT * atr, MIN_STOP_PIPS * pip(pair))
 
 
-def fmt(pair, x):
-    return f"{x:.3f}" if pair.endswith("JPY") else f"{x:.5f}"
+def sr_blocked(direction, price, risk, res, sup):
+    if direction == 1:
+        above = [x for x in res if x > price]
+        return bool(above) and (min(above) - price) < SR_BUFFER_R * risk
+    below = [x for x in sup if x < price]
+    return bool(below) and (price - max(below)) < SR_BUFFER_R * risk
 
 
-def open_trades():
-    return api("GET", f"/v3/accounts/{ACCOUNT}/openTrades")["trades"]
+def filter_reason(row, direction, risk, price, res, sup):
+    """Return the name of the first filter that blocks the trade, or None."""
+    for k in ("adx", "bw", "bw_cut", "vol_ratio", "atr"):
+        if pd.isna(row[k]):
+            return "warmup"
+    if row["adx"] < ADX_MIN:
+        return "adx (ranging)"
+    if row["bw"] < row["bw_cut"]:
+        return "squeeze"
+    if row["vol_ratio"] < VOL_MIN_RATIO:
+        return "volume"
+    if row["htf"] != direction:
+        return "h1_trend"
+    if sr_blocked(direction, price, risk, res, sup):
+        return "sr_level"
+    return None
 
 
-def account_info():
-    a = api("GET", f"/v3/accounts/{ACCOUNT}/summary")["account"]
-    return float(a["balance"]), a["currency"]
+def trend_label(row):
+    if pd.isna(row["adx"]) or row["adx"] < ADX_MIN or row["htf"] == 0:
+        return "Sideways"
+    return "Bullish" if row["htf"] == 1 else "Bearish"
 
 
-def live_price(pair):
-    """Current bid/ask plus the rate to convert quote-currency losses to account currency."""
-    d = api("GET", f"/v3/accounts/{ACCOUNT}/pricing",
-            params={"instruments": pair, "includeHomeConversions": "true"})
-    p = d["prices"][0]
-    if p.get("tradeable") is False:
-        raise RuntimeError("market not tradeable right now")
-    bid = float(p["bids"][0]["price"])
-    ask = float(p["asks"][0]["price"])
-    quote = pair.split("_")[1]
-    conv = None
-    for h in d.get("homeConversions", []):
-        if h["currency"] == quote:
-            conv = float(h["accountLoss"])
-    return bid, ask, quote, conv
+# ----------------------------------------------------------------------------
+# BACKTEST
+# ----------------------------------------------------------------------------
+def simulate(d, pair, daily, start_ts, use_filters):
+    times = d["time"].tolist()
+    bo, bh, bl, bc = (d[c].to_numpy() for c in ("bo", "bh", "bl", "bc"))
+    ao, ah, al, ac = (d[c].to_numpy() for c in ("ao", "ah", "al", "ac"))
+    atr = d["atr"].to_numpy()
+    ubuy = d["ut_buy"].to_numpy()
+    usell = d["ut_sell"].to_numpy()
+    n = len(d)
+    trades, skipped = [], {}
+    busy = -1
+    for i in range(n - 1):
+        if times[i] < start_ts or i <= busy:
+            continue
+        direction = 1 if ubuy[i] else (-1 if usell[i] else 0)
+        if direction == 0 or np.isnan(atr[i]):
+            continue
+        j = i + 1  # enter at the open of the next candle
+        entry = ao[j] if direction == 1 else bo[j]
+        risk = calc_risk(pair, atr[i])
+        reason = None
+        if use_filters:
+            res, sup = sr_levels(daily, d["close_time"].iloc[i])
+            reason = filter_reason(d.iloc[i], direction, risk, entry, res, sup)
+        if reason is None and (ao[j] - bo[j]) / risk > MAX_SPREAD_RISK:
+            reason = "spread"
+        if reason:
+            skipped[reason] = skipped.get(reason, 0) + 1
+            continue
+        sl = entry - direction * risk
+        tp = entry + direction * RR * risk
+        end = min(j + MAX_BARS_HELD, n - 1)
+        r = None
+        k = j
+        for k in range(j, end + 1):
+            if direction == 1:  # long exits at the bid
+                if bl[k] <= sl:
+                    r = -1.0
+                    break
+                if bh[k] >= tp:
+                    r = RR
+                    break
+            else:  # short exits at the ask
+                if ah[k] >= sl:
+                    r = -1.0
+                    break
+                if al[k] <= tp:
+                    r = RR
+                    break
+        if r is None:
+            exit_p = bc[k] if direction == 1 else ac[k]
+            r = direction * (exit_p - entry) / risk
+        busy = k
+        trades.append({"pair": pair, "entry": times[j], "exit": times[k], "dir": direction, "r": float(r)})
+    return trades, skipped
 
 
-def size_units(risk_price, quote, conv):
-    """Units so that hitting the stop loses about RISK_PCT% of the balance."""
-    balance, acct_ccy = account_info()
-    if conv is None:
-        if quote != acct_ccy:
-            raise RuntimeError(f"no conversion rate {quote}->{acct_ccy}")
-        conv = 1.0
-    units = int((balance * RISK_PCT / 100) / (risk_price * conv))
-    return max(0, min(units, MAX_UNITS))
+def stats(trades):
+    if not trades:
+        return {"n": 0, "win": 0.0, "avg": 0.0, "total": 0.0, "pf": 0.0, "dd": 0.0}
+    ts = sorted(trades, key=lambda t: t["exit"])
+    r = np.array([t["r"] for t in ts])
+    gp = r[r > 0].sum()
+    gl = -r[r < 0].sum()
+    eq = np.cumsum(r)
+    dd = float((np.maximum.accumulate(eq) - eq).max())
+    return {
+        "n": len(r),
+        "win": 100.0 * (r > 0).mean(),
+        "avg": float(r.mean()),
+        "total": float(r.sum()),
+        "pf": float(min(gp / gl, 99.0)) if gl > 0 else 99.0,
+        "dd": dd,
+    }
 
 
-def exposure(trades):
-    """Net same-direction count per currency (long EUR_USD = +1 EUR, -1 USD)."""
-    ex = {}
-    for t in trades:
-        base, quote = t["instrument"].split("_")
-        d = 1 if float(t["currentUnits"]) > 0 else -1
-        ex[base] = ex.get(base, 0) + d
-        ex[quote] = ex.get(quote, 0) - d
-    return ex
+def stat_line(label, trades):
+    s = stats(trades)
+    return (
+        f"{label:<18}{s['n']:>6}{s['win']:>8.1f}%{s['avg']:>8.2f}"
+        f"{s['total']:>9.1f}{s['pf']:>7.2f}{s['dd']:>9.1f}"
+    )
 
 
-def exposure_ok(ex, pair, signal):
-    base, quote = pair.split("_")
-    d = 1 if signal == "BUY" else -1
-    return (abs(ex.get(base, 0) + d) <= MAX_PER_CURRENCY
-            and abs(ex.get(quote, 0) - d) <= MAX_PER_CURRENCY)
-
-
-def add_exposure(ex, pair, signal):
-    base, quote = pair.split("_")
-    d = 1 if signal == "BUY" else -1
-    ex[base] = ex.get(base, 0) + d
-    ex[quote] = ex.get(quote, 0) - d
-
-
-def place(sig, units):
-    pair = sig["pair"]
-    units = units if sig["signal"] == "BUY" else -units
-    body = {"order": {
-        "type": "MARKET", "instrument": pair, "units": str(units),
-        "timeInForce": "FOK", "positionFill": "DEFAULT",
-        "stopLossOnFill": {"price": fmt(pair, sig["sl"])},
-        "takeProfitOnFill": {"price": fmt(pair, sig["tp"])},
-    }}
-    r = api("POST", f"/v3/accounts/{ACCOUNT}/orders", json=body)
-    if "orderFillTransaction" in r:
-        print(f"  -> FILLED {units} units @ {r['orderFillTransaction'].get('price')}", flush=True)
-        return True
-    why = (r.get("orderCancelTransaction") or r.get("orderRejectTransaction") or {}).get(
-        "reason", list(r.keys()))
-    print(f"  -> NOT filled: {why}", flush=True)
-    return False
-
-
-def execute(s):
-    """Re-price on live bid/ask, check stop and spread, size by risk, place the order."""
-    pair = s["pair"]
-    bid, ask, quote, conv = live_price(pair)
-    buy = s["signal"] == "BUY"
-    entry = ask if buy else bid
-    risk = (entry - s["sl"]) if buy else (s["sl"] - entry)
-    if risk <= 0:
-        print("  skipped: price already beyond the stop", flush=True)
-        return False
-    if risk > MAX_RISK_ATR * s["atr"]:
-        print(f"  skipped: stop too wide ({risk / s['atr']:.1f} ATR)", flush=True)
-        return False
-    if (ask - bid) > MAX_SPREAD_FRAC * risk:
-        print(f"  skipped: spread too wide ({(ask - bid) / risk:.0%} of risk)", flush=True)
-        return False
-    s["entry"] = entry
-    s["tp"] = entry + RR * risk if buy else entry - RR * risk
-    try:
-        units = size_units(risk, quote, conv)
-    except Exception as e:
-        units = UNITS
-        print(f"  sizing failed ({e}); using fixed {UNITS} units", flush=True)
-    if units < 1:
-        print("  skipped: risk-based size rounds to 0 units", flush=True)
-        return False
-    print(f"  re-priced: ENTRY {fmt(pair, entry)} SL {fmt(pair, s['sl'])} "
-          f"TP {fmt(pair, s['tp'])} | {units} units", flush=True)
-    return place(s, units)
-
-
-def cycle():
-    now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    print(f"\n=== Scan {now} ===", flush=True)
-    trades = open_trades()
-    busy = {t["instrument"] for t in trades}
-    count = len(trades)
-    ex = exposure(trades)
+def run_backtest(api, days):
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+    start_ts = pd.Timestamp(start)
+    log.info(f"BACKTEST | last {days} days | {len(PAIRS)} pairs | fetching OANDA history...")
+    base_all, plus_all, skip_all = [], [], {}
+    per_pair = []
     for pair in PAIRS:
         try:
-            s = analyse(pair)
-            if not s:
+            m15 = fetch_range(api, pair, "M15", start - timedelta(days=5))
+            h1 = fetch_range(api, pair, "H1", start - timedelta(days=25))
+            dly = fetch_range(api, pair, "D", start - timedelta(days=120))
+            if len(m15) < 300 or len(h1) < 250:
+                log.info(f"{pair} | not enough history, skipped")
                 continue
-            line = f"{pair} | {s['trend']} | {s['signal']}"
-            if s["signal"] == "NO TRADE" and s["blocked"]:
-                line += " | blocked: " + ", ".join(s["blocked"])
-            if s["signal"] != "NO TRADE":
-                risk = abs(s["entry"] - s["sl"])
-                line += (f" | ENTRY {fmt(pair, s['entry'])} SL {fmt(pair, s['sl'])}"
-                         f" TP {fmt(pair, s['tp'])} | RR 1:{abs(s['tp']-s['entry'])/risk:.1f}")
-            print(line, flush=True)
-            if s["signal"] != "NO TRADE":
-                if pair in busy:
-                    print("  skipped: already have a trade on this pair")
-                elif count >= MAX_POSITIONS:
-                    print("  skipped: max positions reached")
-                elif not exposure_ok(ex, pair, s["signal"]):
-                    print("  skipped: too much exposure to one currency")
-                elif execute(s):
-                    busy.add(pair)
-                    count += 1
-                    add_exposure(ex, pair, s["signal"])
+            d = add_htf_trend(prepare(m15), h1)
+            base, _ = simulate(d, pair, dly, start_ts, use_filters=False)
+            plus, sk = simulate(d, pair, dly, start_ts, use_filters=True)
+            base_all += base
+            plus_all += plus
+            for k, v in sk.items():
+                skip_all[k] = skip_all.get(k, 0) + v
+            per_pair.append((pair, stats(base), stats(plus)))
+            log.info(f"{pair} | done | baseline {len(base)} trades | UT+ {len(plus)} trades")
         except Exception as e:
-            print(f"{pair} error: {e}", flush=True)
+            log.error(f"{pair} | BACKTEST ERROR | {e}")
+
+    log.info("")
+    log.info(f"===== BACKTEST RESULTS (last {days} days, all results in R = multiples of risk) =====")
+    log.info(f"{'':<18}{'trades':>6}{'win%':>9}{'avgR':>8}{'totalR':>9}{'PF':>7}{'maxDD':>9}")
+    log.info(stat_line("UT baseline", base_all))
+    log.info(stat_line("UT+ (filters)", plus_all))
+    ordered = sorted(plus_all, key=lambda t: t["entry"])
+    half = len(ordered) // 2
+    log.info(stat_line("UT+ 1st half", ordered[:half]))
+    log.info(stat_line("UT+ 2nd half", ordered[half:]))
+    log.info("")
+    log.info("Signals blocked by UT+ filters: " + (", ".join(f"{k} {v}" for k, v in sorted(skip_all.items(), key=lambda x: -x[1])) or "none"))
+    log.info("")
+    log.info(f"{'pair':<10}{'base n':>8}{'base R':>9}{'UT+ n':>8}{'UT+ R':>9}")
+    for pair, b, p in per_pair:
+        log.info(f"{pair:<10}{b['n']:>8}{b['total']:>9.1f}{p['n']:>8}{p['total']:>9.1f}")
+    log.info("")
+    be = 100.0 / (1.0 + RR)
+    log.info(f"Break-even win rate at 1:{RR:g} is {be:.0f}%. Look for: positive avgR in BOTH halves, PF above 1.2, enough trades (50+).")
+    log.info("Backtests ignore slippage, swap fees and news gaps. Treat them as a sanity check, not a promise.")
+    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+
+
+# ----------------------------------------------------------------------------
+# LIVE
+# ----------------------------------------------------------------------------
+def place_order(api, pair, direction, sl, tp):
+    units = UNITS if direction == 1 else -UNITS
+    body = {
+        "order": {
+            "type": "MARKET",
+            "instrument": pair,
+            "units": str(units),
+            "timeInForce": "FOK",
+            "positionFill": "DEFAULT",
+            "stopLossOnFill": {"price": fmt_price(pair, sl), "timeInForce": "GTC"},
+            "takeProfitOnFill": {"price": fmt_price(pair, tp), "timeInForce": "GTC"},
+        }
+    }
+    status, j = api.post(f"/v3/accounts/{api.account}/orders", body)
+    fill = j.get("orderFillTransaction")
+    if fill:
+        trade_id = (fill.get("tradeOpened") or {}).get("tradeID", "?")
+        return True, f"ORDER FILLED | trade {trade_id} @ {fill.get('price')}"
+    cancel = j.get("orderCancelTransaction")
+    if cancel:
+        return False, f"ORDER CANCELLED | {cancel.get('reason')}"
+    return False, f"ORDER REJECTED | HTTP {status} | {str(j)[:200]}"
+
+
+def process_pair(api, pair, prices, open_pairs):
+    m15 = fetch_recent(api, pair, "M15", 500)
+    if len(m15) < 200:
+        log.info(f"{pair} | NO TRADE | blocked: not enough candles")
+        return
+    h1 = fetch_recent(api, pair, "H1", 300)
+    d = add_htf_trend(prepare(m15), h1)
+    row = d.iloc[-1]
+    now = pd.Timestamp(datetime.now(timezone.utc))
+    if (now - row["close_time"]).total_seconds() > STALE_SECONDS:
+        log.info(f"{pair} | NO TRADE | blocked: stale data (market closed?)")
+        return
+
+    trend = trend_label(row)
+    direction = 1 if row["ut_buy"] else (-1 if row["ut_sell"] else 0)
+    if direction == 0:
+        log.info(f"{pair} | {trend} | NO TRADE | blocked: no_signal")
+        return
+    side = "BUY" if direction == 1 else "SELL"
+
+    if pair in open_pairs:
+        log.info(f"{pair} | {trend} | {side} | blocked: position already open")
+        return
+    if len(open_pairs) >= MAX_OPEN_TRADES:
+        log.info(f"{pair} | {trend} | {side} | blocked: max open trades")
+        return
+    if pair not in prices:
+        log.info(f"{pair} | {trend} | {side} | blocked: no live price / not tradeable")
+        return
+
+    bid, ask = prices[pair]
+    entry = ask if direction == 1 else bid
+    risk = calc_risk(pair, row["atr"])
+    dly = fetch_recent(api, pair, "D", 120)
+    res, sup = sr_levels(dly, now)
+    reason = filter_reason(row, direction, risk, entry, res, sup)
+    if reason:
+        log.info(f"{pair} | {trend} | NO TRADE | blocked: {reason}")
+        return
+    spread_ratio = (ask - bid) / risk
+    if spread_ratio > MAX_SPREAD_RISK:
+        log.info(f"{pair} | {trend} | {side} | SKIPPED: spread too wide ({spread_ratio * 100:.0f}% of risk)")
+        return
+
+    sl = entry - direction * risk
+    tp = entry + direction * RR * risk
+    log.info(
+        f"{pair} | {trend} | {side} | SIGNAL ENTRY {fmt_price(pair, entry)} "
+        f"SL {fmt_price(pair, sl)} TP {fmt_price(pair, tp)} | RR 1:{RR:.1f}"
+    )
+    ok, msg = place_order(api, pair, direction, sl, tp)
+    log.info(f"{pair} | {msg}")
+    if ok:
+        open_pairs.add(pair)
+
+
+def live_cycle(api):
+    trades = api.get(f"/v3/accounts/{api.account}/openTrades").get("trades", [])
+    open_pairs = {t["instrument"] for t in trades}
+    prices = get_prices(api)
+    log.info(f"--- scan | {len(open_pairs)} open trade(s) ---")
+    for pair in PAIRS:
+        try:
+            process_pair(api, pair, prices, open_pairs)
+        except Exception as e:
+            log.error(f"{pair} | ERROR | {e}")
+
+
+def seconds_to_next_bar():
+    now = datetime.now(timezone.utc)
+    mins = 15 - (now.minute % 15)
+    nxt = now.replace(second=0, microsecond=0) + timedelta(minutes=mins)
+    return max(1.0, (nxt - now).total_seconds() + 5)
 
 
 def main():
-    print("Bot started (PRACTICE). Pairs:", ", ".join(PAIRS), flush=True)
+    mode = (sys.argv[1] if len(sys.argv) > 1 else os.getenv("MODE", "live")).lower()
+    api = Oanda()
+    if mode == "backtest":
+        days = int(sys.argv[2]) if len(sys.argv) > 2 else _i("BACKTEST_DAYS", 90)
+        run_backtest(api, days)
+        while True:  # idle so Railway does not keep re-running it
+            time.sleep(3600)
+
+    log.info(
+        f"UT+ bot live | {len(PAIRS)} pairs | units {UNITS} | SL {SL_ATR_MULT}xATR (min {MIN_STOP_PIPS} pips) | RR 1:{RR:g}"
+    )
     while True:
+        wait = seconds_to_next_bar()
+        log.info(f"Waiting {wait:.0f}s for the next 15-minute candle close...")
+        time.sleep(wait)
         try:
-            cycle()
+            live_cycle(api)
         except Exception as e:
-            print("cycle error:", e, flush=True)
-        # sleep until 10 seconds after the next 15-minute mark
-        t = time.time()
-        time.sleep(900 - (t % 900) + 10)
+            log.error(f"CYCLE ERROR | {e}")
 
 
 if __name__ == "__main__":
