@@ -10,7 +10,7 @@ Exits  : backtest compares a fixed 1:3 target against "flip" (exit when UT Bot s
 
 Run:      python bot.py
 Backtest: set Railway variable MODE=backtest (optionally BACKTEST_DAYS=180 and
-          BACKTEST_KEYS=1,2,3 to compare UT Bot sensitivities) and redeploy,
+          BACKTEST_KEYS=1,2,3 and BACKTEST_ADX=0,15,20,25 to compare settings) and redeploy,
           or run: python bot.py backtest 180
 """
 import logging
@@ -278,11 +278,20 @@ def add_htf_trend(d, h1):
     return m.reset_index(drop=True)
 
 
-def sr_levels(daily, as_of, lookback=90):
-    """Confirmed daily swing highs (resistance) and lows (support) known at time `as_of`."""
+_SR_CACHE = {}
+
+
+def sr_levels(daily, as_of, lookback=90, cache=False):
+    """Confirmed daily swing highs (resistance) and lows (support) known at time `as_of`.
+    cache=True is only for backtests, where the daily frame is long-lived."""
     if daily is None or daily.empty:
         return [], []
-    d = daily[daily["time"] + pd.Timedelta(days=1) <= as_of].tail(lookback).reset_index(drop=True)
+    avail = daily["time"] + pd.Timedelta(days=1)
+    cnt = int((avail <= as_of).sum())
+    ck = (id(daily), cnt, lookback)
+    if cache and ck in _SR_CACHE:
+        return _SR_CACHE[ck]
+    d = daily.iloc[:cnt].tail(lookback).reset_index(drop=True)
     h = d["h"].to_numpy()
     l = d["l"].to_numpy()
     res, sup = [], []
@@ -291,6 +300,8 @@ def sr_levels(daily, as_of, lookback=90):
             res.append(h[i])
         if l[i] <= l[i - 2:i + 3].min():
             sup.append(l[i])
+    if cache:
+        _SR_CACHE[ck] = (res, sup)
     return res, sup
 
 
@@ -355,8 +366,11 @@ def simulate(d, pair, daily, start_ts, use_filters, exit_mode="fixed"):
         risk = calc_risk(pair, atr[i])
         reason = None
         if use_filters:
-            res, sup = sr_levels(daily, d["close_time"].iloc[i])
-            reason = filter_reason(d.iloc[i], direction, risk, entry, res, sup)
+            reason = filter_reason(d.iloc[i], direction, risk, entry, [], [])
+            if reason is None:  # only look up S/R when the cheaper filters pass
+                res, sup = sr_levels(daily, d["close_time"].iloc[i], cache=True)
+                if sr_blocked(direction, entry, risk, res, sup):
+                    reason = "sr_level"
         if reason is None and (ao[j] - bo[j]) / risk > MAX_SPREAD_RISK:
             reason = "spread"
         if reason:
@@ -440,20 +454,18 @@ def stat_line(label, trades):
     )
 
 
-BT_CONFIGS = [
-    ("fixed UT", False, "fixed"),
-    ("fixed UT+", True, "fixed"),
-    ("flip UT", False, "flip"),
-    ("flip UT+", True, "flip"),
-]
-
-
 def run_backtest(api, days):
+    global ADX_MIN
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=days)
     start_ts = pd.Timestamp(start)
     keys = [float(x) for x in os.getenv("BACKTEST_KEYS", "").split(",") if x.strip()] or [UT_KEY]
-    log.info(f"BACKTEST | last {days} days | {len(PAIRS)} pairs | UT_KEY values {keys} | fetching OANDA history...")
+    adxs = [float(x) for x in os.getenv("BACKTEST_ADX", "").split(",") if x.strip()] or [ADX_MIN]
+    single = len(keys) == 1 and len(adxs) == 1
+    orig_adx = ADX_MIN
+    log.info(
+        f"BACKTEST | last {days} days | {len(PAIRS)} pairs | UT_KEY {keys} | ADX_MIN {adxs} | fetching OANDA history..."
+    )
     data = {}
     for pair in PAIRS:
         try:
@@ -468,47 +480,69 @@ def run_backtest(api, days):
         except Exception as e:
             log.error(f"{pair} | BACKTEST ERROR | {e}")
 
+    per_pair = {p: {} for p in data}
     for key in keys:
-        results = {name: [] for name, _, _ in BT_CONFIGS}
-        skip_plus = {}
-        per_pair = []
+        prepared = {}
         for pair, (m15, h1, dly) in data.items():
             try:
-                d = add_htf_trend(prepare(m15, key), h1)
-                row = {}
-                for name, use_f, mode in BT_CONFIGS:
-                    tr, sk = simulate(d, pair, dly, start_ts, use_f, mode)
-                    results[name] += tr
-                    row[name] = stats(tr)
-                    if name == "fixed UT+":
-                        for k2, v in sk.items():
-                            skip_plus[k2] = skip_plus.get(k2, 0) + v
-                per_pair.append((pair, row))
+                prepared[pair] = add_htf_trend(prepare(m15, key), h1)
             except Exception as e:
                 log.error(f"{pair} | BACKTEST ERROR | {e}")
+
+        # plain UT Bot (no filters) does not depend on the ADX setting, so run it once per key
+        base = {"fixed UT": [], "flip UT": []}
+        for pair, d in prepared.items():
+            dly = data[pair][2]
+            for name, mode in (("fixed UT", "fixed"), ("flip UT", "flip")):
+                tr, _ = simulate(d, pair, dly, start_ts, False, mode)
+                base[name] += tr
+                if name == "flip UT":
+                    per_pair[pair]["flip UT"] = stats(tr)
 
         log.info("")
         log.info(f"===== BACKTEST | UT_KEY {key:g} | last {days} days | results in R (multiples of risk) =====")
         log.info(f"{'':<18}{'trades':>6}{'win%':>9}{'avgR':>8}{'totalR':>9}{'PF':>7}{'maxDD':>9}")
-        for name, _, _ in BT_CONFIGS:
-            log.info(stat_line(name, results[name]))
-        ordered = sorted(results["flip UT+"], key=lambda t: t["entry"])
-        half = len(ordered) // 2
-        log.info(stat_line("flip UT+ 1st half", ordered[:half]))
-        log.info(stat_line("flip UT+ 2nd half", ordered[half:]))
-        log.info("Blocked by UT+ filters: " + (", ".join(f"{k2} {v}" for k2, v in sorted(skip_plus.items(), key=lambda x: -x[1])) or "none"))
-        if len(keys) == 1:
-            log.info("")
-            log.info(f"{'pair':<10}{'fixed UT+ R':>13}{'flip UT R':>12}{'flip UT+ R':>13}{'flip UT+ n':>12}")
-            for pair, row in per_pair:
-                log.info(
-                    f"{pair:<10}{row['fixed UT+']['total']:>13.1f}{row['flip UT']['total']:>12.1f}"
-                    f"{row['flip UT+']['total']:>13.1f}{row['flip UT+']['n']:>12}"
-                )
+        log.info(stat_line("fixed UT", base["fixed UT"]))
+        log.info(stat_line("flip UT", base["flip UT"]))
+
+        for adx in adxs:
+            ADX_MIN = adx
+            plus = {"fixed": [], "flip": []}
+            skip = {}
+            for pair, d in prepared.items():
+                dly = data[pair][2]
+                for mode in ("fixed", "flip"):
+                    tr, sk = simulate(d, pair, dly, start_ts, True, mode)
+                    plus[mode] += tr
+                    if mode == "fixed":
+                        for k2, v in sk.items():
+                            skip[k2] = skip.get(k2, 0) + v
+                    per_pair[pair][f"{mode} UT+"] = stats(tr)
+            tag = f"ADX{adx:g}"
+            ordered = sorted(plus["flip"], key=lambda t: t["entry"])
+            half = len(ordered) // 2
+            log.info(stat_line(f"{tag} fixed", plus["fixed"]))
+            log.info(stat_line(f"{tag} flip", plus["flip"]))
+            log.info(stat_line(f"{tag} flip 1st", ordered[:half]))
+            log.info(stat_line(f"{tag} flip 2nd", ordered[half:]))
+            top = sorted(skip.items(), key=lambda x: -x[1])[:4]
+            log.info(f"  blocked: " + (", ".join(f"{k2} {v}" for k2, v in top) or "none"))
+        ADX_MIN = orig_adx
+
+    if single:
+        log.info("")
+        log.info(f"{'pair':<10}{'fixed UT+ R':>13}{'flip UT R':>12}{'flip UT+ R':>13}{'flip UT+ n':>12}")
+        for pair, row in per_pair.items():
+            if "flip UT+" not in row:
+                continue
+            log.info(
+                f"{pair:<10}{row['fixed UT+']['total']:>13.1f}{row['flip UT']['total']:>12.1f}"
+                f"{row['flip UT+']['total']:>13.1f}{row['flip UT+']['n']:>12}"
+            )
 
     log.info("")
     log.info(f"fixed exit: break-even win rate is {100.0 / (1.0 + RR):.0f}% at 1:{RR:g}. flip exit: just needs avgR above 0.")
-    log.info("Look for: avgR above 0 in BOTH halves, PF above 1.2, 100+ trades, and a similar result across neighbouring UT_KEY values (one lucky setting is probably noise).")
+    log.info("ADX0 means the ADX filter is off. Look for: avgR above 0 in BOTH halves, PF above 1.2, 100+ trades, and a similar result for neighbouring settings (one lucky setting is probably noise).")
     log.info("Backtests ignore slippage, swap fees and news gaps. Treat them as a sanity check, not a promise.")
     log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
 
