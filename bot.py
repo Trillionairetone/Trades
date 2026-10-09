@@ -8,6 +8,7 @@ Risk   : stop = 1.5 x ATR (STOP_MODE=atr) or the UT trailing-stop distance (STOP
 Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
          BACKTEST_STRATEGY=srbb backtests your original bot instead (daily S/R + Bollinger bounce)
          BACKTEST_STRATEGY=flux backtests the two Flux Charts scripts (ICT Power Of Three, Volumized Order Blocks)
+         BACKTEST_STRATEGY=po3s backtests the session Power Of Three (Asian range -> London fake move -> fade)
 Live   : EXIT_MODE=fixed (stop + 1:3 target, default) or EXIT_MODE=flip (stop only, the bot closes the
          trade itself when UT Bot signals the other way; only trades the bot opened are managed)
 Exits  : backtest compares "flip" (exit when UT Bot signals the other way) with "sr" (same, plus a take-profit
@@ -1067,6 +1068,153 @@ def run_backtest_flux(api, days):
 
 
 # ----------------------------------------------------------------------------
+# BACKTEST: session Power Of Three (rules fixed before testing)
+#   accumulation = the Asian range, 00:00-07:00 London time
+#   manipulation = price pushes beyond that range (+0.5 ATR, then +0.6 ATR more, as in the Flux script)
+#                  between 07:00 and 10:00 London time (the London open)
+#   entry        = fade it at the next candle; stop 5 x ATR(50), target 0.86R (unchanged from the Flux script)
+#   variant "+PD"= the fake move must also sweep yesterday's high (for a sell) or low (for a buy)
+#   costs        = only the tightest-spread pairs, and no entries outside the London open
+# ----------------------------------------------------------------------------
+PO3S_PAIRS = [p.strip().upper() for p in os.getenv("PO3S_PAIRS", "EUR_USD,USD_JPY,GBP_USD").split(",") if p.strip()]
+PO3S_ASIA_END = 7 * 60      # minutes after midnight, London time
+PO3S_WINDOW_END = 10 * 60
+
+
+def _fixed_exit(direction, j, entry, sl, tp, rr, risk, bh, bl, bc, ah, al, ac, n):
+    end = min(j + SB_MAX_BARS, n - 1)
+    k = j
+    for k in range(j, end + 1):
+        if direction == 1:
+            if bl[k] <= sl:
+                return -1.0, k
+            if bh[k] >= tp:
+                return rr, k
+        else:
+            if ah[k] >= sl:
+                return -1.0, k
+            if al[k] <= tp:
+                return rr, k
+    exit_p = bc[k] if direction == 1 else ac[k]
+    return direction * (exit_p - entry) / risk, k
+
+
+def simulate_po3_session(d, dly, pair, start_ts, need_sweep):
+    t = d["time"].tolist()
+    h, l = d["h"].to_numpy(), d["l"].to_numpy()
+    bo, bh, bl, bc = (d[k].to_numpy() for k in ("bo", "bh", "bl", "bc"))
+    ao, ah, al, ac = (d[k].to_numpy() for k in ("ao", "ah", "al", "ac"))
+    atr = calc_atr(d, 50).to_numpy()
+    lt = d["time"].dt.tz_convert("Europe/London")
+    lday = lt.dt.date.to_numpy()
+    lmin = (lt.dt.hour * 60 + lt.dt.minute).to_numpy()
+    n = len(d)
+    pdh = pdl = None
+    if need_sweep:  # yesterday's high/low, known when each candle closes
+        dd = dly[["time", "h", "l"]].copy().reset_index(drop=True)
+        dd["avail"] = dd["time"] + pd.Timedelta(days=1)
+        ct = (d["time"] + pd.Timedelta(minutes=TF_MIN[TIMEFRAME])).to_frame("ct")
+        m = pd.merge_asof(ct.sort_values("ct"), dd[["avail", "h", "l"]].sort_values("avail"),
+                          left_on="ct", right_on="avail", direction="backward")
+        pdh, pdl = m["h"].to_numpy(), m["l"].to_numpy()
+    _, acc_mult, manip_mult = PO3_PRESETS["small"]
+    trades = []
+    busy_until = -1
+    cur_day = None
+    asia_hi = asia_lo = None
+    asia_n = 0
+    done_today = False
+    acc_top = acc_bot = None
+    for i in range(n - 1):
+        if lday[i] != cur_day:
+            cur_day, asia_hi, asia_lo, asia_n, done_today, acc_top = lday[i], -np.inf, np.inf, 0, False, None
+        if lmin[i] < PO3S_ASIA_END:
+            asia_hi, asia_lo, asia_n = max(asia_hi, h[i]), min(asia_lo, l[i]), asia_n + 1
+            continue
+        if lmin[i] >= PO3S_WINDOW_END or done_today or asia_n < 20 or np.isnan(atr[i]):
+            continue
+        if acc_top is None:  # set the accumulation box once, at the London open
+            a0 = atr[i - 1]
+            if np.isnan(a0) or asia_hi - asia_lo > acc_mult * a0:
+                done_today = True
+                continue
+            acc_top, acc_bot = asia_hi + 0.5 * a0, asia_lo - 0.5 * a0
+        if i <= busy_until:
+            continue
+        direction = 0
+        if h[i] > acc_top + manip_mult * atr[i] and (pdh is None or h[i] > pdh[i]):
+            direction = -1
+        elif l[i] < acc_bot - manip_mult * atr[i] and (pdl is None or l[i] < pdl[i]):
+            direction = 1
+        if direction == 0:
+            continue
+        done_today = True
+        j = i + 1
+        entry = ao[j] if direction == 1 else bo[j]
+        risk = PO3_SL_ATR * atr[i]
+        sl, tp = entry - direction * risk, entry + direction * PO3_RR * risk
+        r, k = _fixed_exit(direction, j, entry, sl, tp, PO3_RR, risk, bh, bl, bc, ah, al, ac, n)
+        busy_until = k
+        if t[j] >= start_ts:
+            trades.append({"pair": pair, "entry": t[j], "exit": t[k], "dir": direction, "r": float(r),
+                           "risk_pips": risk / pip(pair), "spread_frac": (ao[j] - bo[j]) / risk})
+    return trades
+
+
+def _summary_line(label, tr):
+    s = stats(tr)
+    ordered = sorted(tr, key=lambda x: x["entry"])
+    h2 = len(ordered) // 2
+    a1, a2 = stats(ordered[:h2])["avg"], stats(ordered[h2:])["avg"]
+    return f"{label:<8}{s['n']:>5}{s['win']:>5.0f}%{s['avg']:>6.2f}{s['pf']:>5.2f}{a1:>6.2f}{a2:>6.2f}"
+
+
+def run_backtest_po3s(api, days):
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+    start_ts = pd.Timestamp(start)
+    log.info(f"BACKTEST | session Power Of Three | {TIMEFRAME} | last {days} days | pairs {PO3S_PAIRS}")
+    ref, sess, sweep = [], [], []
+    per_pair = []
+    for pair in PO3S_PAIRS:
+        try:
+            sig = fetch_range(api, pair, TIMEFRAME, start - timedelta(days=10))
+            dly = fetch_range(api, pair, "D", start - timedelta(days=20))
+            if len(sig) < 300:
+                log.info(f"{pair} | not enough history, skipped")
+                continue
+            r0 = simulate_po3(sig, pair, start_ts)
+            r1 = simulate_po3_session(sig, dly, pair, start_ts, need_sweep=False)
+            r2 = simulate_po3_session(sig, dly, pair, start_ts, need_sweep=True)
+            ref += r0
+            sess += r1
+            sweep += r2
+            per_pair.append((pair, stats(r1), stats(r2)))
+            log.info(f"{pair} | done | session {len(r1)} trades | +PD {len(r2)} trades")
+        except Exception as e:
+            log.error(f"{pair} | BACKTEST ERROR | {e}")
+
+    log.info("")
+    log.info(f"===== SESSION PO3 | {TIMEFRAME} | last {days} days | results in R =====")
+    log.info(f"{'':<8}{'n':>5}{'win':>6}{'avgR':>6}{'PF':>5}{'1st':>6}{'2nd':>6}")
+    log.info(_summary_line("Flux ref", ref))
+    log.info(_summary_line("Session", sess))
+    log.info(_summary_line("Sess+PD", sweep))
+    log.info("Flux ref = the original script on the same pairs, any hour (for comparison only).")
+    log.info("1st/2nd = average R in the older/newer half of the period.")
+    log.info("")
+    log.info(f"{'pair':<9}{'Sess n':>7}{'Sess R':>8}{'+PD n':>7}{'+PD R':>8}")
+    for pair, s1, s2 in per_pair:
+        log.info(f"{pair:<9}{s1['n']:>7}{s1['total']:>8.1f}{s2['n']:>7}{s2['total']:>8.1f}")
+    if sess:
+        log.info(f"Session: average stop {np.mean([x['risk_pips'] for x in sess]):.1f} pips, spread "
+                 f"{np.mean([x['spread_frac'] for x in sess]) * 100:.0f}% of risk.")
+    log.info(f"Targets {PO3_RR:g}R per 1R risked, so it needs {100 / (1 + PO3_RR):.0f}%+ wins to break even.")
+    log.info("Need: avgR above 0 in BOTH halves, PF above 1.2, a few hundred trades.")
+    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+
+
+# ----------------------------------------------------------------------------
 # LIVE
 # ----------------------------------------------------------------------------
 def place_order(api, pair, direction, sl, tp=None):
@@ -1222,6 +1370,8 @@ def main():
             run_backtest_srbb(api, days)
         elif strategy == "flux":
             run_backtest_flux(api, days)
+        elif strategy == "po3s":
+            run_backtest_po3s(api, days)
         else:
             run_backtest(api, days)
         while True:  # idle so Railway does not keep re-running it
