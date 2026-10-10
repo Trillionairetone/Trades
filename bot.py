@@ -17,6 +17,7 @@ Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
                                 entry on the pullback into the fair value gap / retest, structural stop
          BACKTEST_STRATEGY=smce tests 3 entries for your strategy: limit pullback vs market at the break vs confirmation candle
         BACKTEST_STRATEGY=po3v2 tests Power Of Three + trend filter + confirmation (break of structure, market entry)
+        BACKTEST_STRATEGY=po3w wide test of PO3 + Echo (12 pairs, full history, + confirmation variants)
         BACKTEST_STRATEGY=combo backtests your strategy + Power Of Three together (fake move against the
                                 H4/H1 trend, then your break of structure back with it)
          BACKTEST_END_DAYS=N   ends the test window N days ago (to test an untouched past period)
@@ -2338,6 +2339,149 @@ def run_backtest_po3v2(api, days):
 
 
 # ----------------------------------------------------------------------------
+# BACKTEST: PO3 + Echo, final wide test (rules fixed before testing)
+#   Base     = PO3 + Echo exactly as before (fade at once, stop 5 x ATR(50), target 0.86R)
+#   Conf1:2 / Conf1:3 = same setup and Echo filter, then wait up to PO3E_BOS_WINDOW candles for a break of
+#              structure back in the fade direction (close beyond the last confirmed swing), enter at the
+#              next open, stop beyond the fake move's extreme (+0.1 ATR). No trend filter (it hurt on M15).
+#   Run on many pairs and the full history so the sample is big enough to decide.
+#   Pass: avgR > 0 in BOTH halves, PF >= 1.2, 300+ trades, and most pairs positive.
+# ----------------------------------------------------------------------------
+PO3W_PAIRS = [p.strip().upper() for p in os.getenv(
+    "PO3W_PAIRS", "EUR_USD,GBP_USD,USD_JPY,AUD_USD,USD_CAD,NZD_USD,USD_CHF,EUR_JPY,GBP_JPY,EUR_GBP,AUD_JPY,EUR_AUD"
+).split(",") if p.strip()]
+
+
+def simulate_po3_echo_conf(d, pair, start_ts, end_ts, rr):
+    acc_len, acc_mult, manip_mult = PO3_PRESETS.get(PO3_MODE, PO3_PRESETS["small"])
+    t = d["time"].tolist()
+    h, l, c = d["h"].to_numpy(), d["l"].to_numpy(), d["c"].to_numpy()
+    bo, bh, bl, bc = (d[k].to_numpy() for k in ("bo", "bh", "bl", "bc"))
+    ao, ah, al, ac = (d[k].to_numpy() for k in ("ao", "ah", "al", "ac"))
+    atr = calc_atr(d, 50).to_numpy()
+    hh = d["h"].rolling(acc_len).max().to_numpy()
+    ll = d["l"].rolling(acc_len).min().to_numpy()
+    sh, sl_ = last_swings(h, l, PO3E_SWING)
+    n = len(d)
+    trades = []
+    count = {"echo disagreed": 0, "no BOS in time": 0}
+    state, i = 0, 0
+    acc_top = acc_bot = None
+    acc_end = 0
+    while i < n - 1:
+        a = atr[i]
+        if np.isnan(hh[i]) or np.isnan(a):
+            i += 1
+            continue
+        if state == 0 and hh[i] - ll[i] <= acc_mult * a:
+            state, acc_end = 1, i
+            acc_top, acc_bot = hh[i] + 0.5 * a, ll[i] - 0.5 * a
+        if state == 1:
+            if h[i] > acc_top or l[i] < acc_bot:
+                state = 2
+            else:
+                acc_end = i
+        direction = 0
+        if state == 2 and i > acc_end:
+            if h[i] > acc_top + manip_mult * a:
+                direction = -1
+            elif l[i] < acc_bot - manip_mult * a:
+                direction = 1
+        if direction == 0:
+            i += 1
+            continue
+        state = 0
+        if echo_direction(c, i) != direction:
+            count["echo disagreed"] += 1
+            i += 1
+            continue
+        ext = l[i] if direction == 1 else h[i]
+        found = None
+        for m in range(i + 1, min(i + PO3E_BOS_WINDOW, n - 2) + 1):
+            if direction == 1:
+                ext = min(ext, l[m])
+            else:
+                ext = max(ext, h[m])
+            level = sh[m - 1] if direction == 1 else sl_[m - 1]
+            if np.isnan(level):
+                continue
+            if (direction == 1 and c[m] > level) or (direction == -1 and c[m] < level):
+                found = m
+                break
+        if found is None:
+            count["no BOS in time"] += 1
+            i += PO3E_BOS_WINDOW + 1
+            continue
+        j = found + 1
+        entry = ao[j] if direction == 1 else bo[j]
+        sl = ext - direction * 0.1 * atr[found]
+        risk = direction * (entry - sl)
+        if risk <= 0:
+            i = j
+            continue
+        tp = entry + direction * rr * risk
+        r, k = _fixed_exit(direction, j, entry, sl, tp, rr, risk, bh, bl, bc, ah, al, ac, n)
+        if start_ts <= t[j] < end_ts:
+            trades.append({"pair": pair, "entry": t[j], "exit": t[k], "dir": direction, "r": float(r),
+                           "risk_pips": risk / pip(pair), "spread_frac": (ao[j] - bo[j]) / risk})
+        i = k + 1
+    return trades, count
+
+
+def run_backtest_po3w(api, days):
+    now = datetime.now(timezone.utc)
+    end = now - timedelta(days=BACKTEST_END_DAYS)
+    start = end - timedelta(days=days)
+    start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+    log.info(f"BACKTEST | PO3 + Echo WIDE TEST | {TIMEFRAME} | {start:%Y-%m-%d} to {end:%Y-%m-%d} | "
+             f"{len(PO3W_PAIRS)} pairs {PO3W_PAIRS}")
+    rows = {"Base": [], "Conf1:2": [], "Conf1:3": []}
+    counts = {}
+    for pair in PO3W_PAIRS:
+        try:
+            sig = fetch_range(api, pair, TIMEFRAME, start - timedelta(days=60))
+            if len(sig) < 300:
+                log.info(f"{pair} | not enough history, skipped")
+                continue
+            tr, _ = simulate_po3_echo(sig, pair, start_ts, use_echo=True, use_bos=False)
+            rows["Base"] += [x for x in tr if x["entry"] < end_ts]
+            for rr in (2.0, 3.0):
+                tr2, cnt = simulate_po3_echo_conf(sig, pair, start_ts, end_ts, rr)
+                rows[f"Conf1:{rr:g}"] += tr2
+                if rr == 2.0:
+                    for k2, v in cnt.items():
+                        counts[k2] = counts.get(k2, 0) + v
+            log.info(f"{pair} | done | first candle {sig['time'].iloc[0]:%Y-%m-%d}")
+        except Exception as e:
+            log.error(f"{pair} | BACKTEST ERROR | {e}")
+
+    log.info("")
+    log.info(f"===== PO3+ECHO WIDE | {TIMEFRAME} | {start:%Y} to {end:%Y} | results in R =====")
+    log.info(f"{'':<8}{'n':>5}{'win':>6}{'avgR':>6}{'PF':>5}{'1st':>6}{'2nd':>6}")
+    for name, tr in rows.items():
+        log.info(_summary_line(name, tr))
+    log.info(f"Coin-flip win rates: Base ({PO3_RR:g}R) = {100 / (1 + PO3_RR):.0f}%, Conf1:2 = 33%, Conf1:3 = 25%.")
+    months = max(days / 30.4, 1)
+    for name, tr in rows.items():
+        if not tr:
+            continue
+        per = {}
+        for x in tr:
+            per.setdefault(x["pair"], []).append(x["r"])
+        pos = sum(1 for v in per.values() if np.mean(v) > 0)
+        log.info(f"{name}: {pos} of {len(per)} pairs positive | spread {np.mean([x['spread_frac'] for x in tr]) * 100:.1f}% "
+                 f"of risk | {len(tr) / months:.1f} trades/month")
+    for name in ("Base", "Conf1:2"):
+        per = {}
+        for x in rows[name]:
+            per.setdefault(x["pair"], []).append(x["r"])
+        log.info(f"{name} by pair: " + ", ".join(f"{k} {np.mean(v):+.2f} ({len(v)})" for k, v in per.items()))
+    log.info("Conf setups: " + ", ".join(f"{k2} {v}" for k2, v in counts.items()))
+    log.info("Pass: avgR > 0 in BOTH halves, PF >= 1.2, 300+ trades, most pairs positive.")
+    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+
+
+# ----------------------------------------------------------------------------
 # LIVE
 # ----------------------------------------------------------------------------
 _NEWS = {"t": 0.0, "events": None}
@@ -2623,6 +2767,8 @@ def main():
             run_backtest_smce(api, days)
         elif strategy == "po3v2":
             run_backtest_po3v2(api, days)
+        elif strategy == "po3w":
+            run_backtest_po3w(api, days)
         else:
             run_backtest(api, days)
         while True:  # idle so Railway does not keep re-running it
