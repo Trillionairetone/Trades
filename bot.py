@@ -22,6 +22,8 @@ Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
         BACKTEST_STRATEGY=scan M15 signal scanner (10 timing/level signals, search 2014-2020, holdout 2020-today)
         BACKTEST_STRATEGY=sax  volume-drift SuperTrend (Swift Algo X style) + 144-combo walk-forward optimizer
         BACKTEST_STRATEGY=xgb  GainzAlgo XG Boost Lite reversals (rolling ML model) vs the same pivots without the model
+        BACKTEST_STRATEGY=po3tools PO3 + Echo entries with the ATR calculator / ATR plotter / TrendGenY stops & targets
+        BACKTEST_STRATEGY=brk  TD Forex Breakout (EMA50/200 + 20-candle breakout + volume) with cost lessons applied
         BACKTEST_STRATEGY=combo backtests your strategy + Power Of Three together (fake move against the
                                 H4/H1 trend, then your break of structure back with it)
          BACKTEST_END_DAYS=N   ends the test window N days ago (to test an untouched past period)
@@ -3207,6 +3209,284 @@ def run_backtest_xgb(api, days):
 
 
 # ----------------------------------------------------------------------------
+# BACKTEST: PO3 + Echo entries with the three risk tools' stops/targets (rules fixed before testing)
+#   Entries are exactly PO3 + Echo Base (fake move out of a quiet range, Echo must agree, enter next open).
+#   Only the stop/target (and one filter) change:
+#     Base     = 5 x ATR(50) stop, 0.86R target (as before)
+#     ATR2.5   = "ATR Stop Loss Calculator": stop 2.5 x ATR(14), target 1:1 (the script has no target)
+#     Plot TP2 = "ATR SL/TP Plotter": stop 1.5 x ATR(14), target TP2 = 2 x ATR(14) (= 1.33R)
+#     Plot+EMA = same, only when its EMA20/EMA50 direction agrees with the trade
+#     TGY      = "TrendGenY": stop beyond the 20-candle low/high + 0.25 ATR, "optimal" target picked by its
+#                efficiency engine: TP1/TP2/TP3 (1 / 1.5 / 2R) x dynamic multiplier 0.5-1.75
+#   Pass: avgR > 0 in BOTH halves, PF >= 1.2, 300+ trades, most pairs positive - and better than Base.
+# ----------------------------------------------------------------------------
+def _tgy_targets(c):
+    """TrendGenY efficiency engine per bar -> (target in R, before the dynamic multiplier, and the multiplier)."""
+    cs = pd.Series(c)
+    path = cs.diff().abs().rolling(20).sum()
+    er = ((cs - cs.shift(20)).abs() / path.replace(0, np.nan)).to_numpy()
+    s1, s2, s3 = er, np.roll(er, 20), np.roll(er, 40)
+    s2[:20] = np.nan
+    s3[:40] = np.nan
+    comp = (3 * s1 + 2 * s2 + s3) / 6
+    d1, d2 = s1 - s2, s2 - s3
+    norm = np.clip(((d1 + d2) / 2 + 1) / 2, 0, 1)
+    improving, worsening = (d1 > 0) & (d2 > 0), (d1 < 0) & (d2 < 0)
+    score = 100 * (0.7 * comp + 0.3 * norm)
+    snorm = np.clip((score - 40) / 40, 0, 1)
+    mult = np.clip(0.5 + snorm * 1.25 + np.where(improving, 0.2, np.where(worsening, -0.25, 0.0)), 0.5, 1.75)
+    rr = np.where(improving & (score >= 80), 2.0, np.where(worsening | (score < 40), 1.0, 1.5))
+    return rr, mult
+
+
+def simulate_po3_tools(d, pair, start_ts, end_ts, variant):
+    acc_len, acc_mult, manip_mult = PO3_PRESETS.get(PO3_MODE, PO3_PRESETS["small"])
+    t = d["time"].tolist()
+    h, l, c = d["h"].to_numpy(), d["l"].to_numpy(), d["c"].to_numpy()
+    bo, bh, bl, bc = (d[k].to_numpy() for k in ("bo", "bh", "bl", "bc"))
+    ao, ah, al, ac = (d[k].to_numpy() for k in ("ao", "ah", "al", "ac"))
+    atr50 = calc_atr(d, 50).to_numpy()
+    atr14 = calc_atr(d, 14).to_numpy()
+    hh = d["h"].rolling(acc_len).max().to_numpy()
+    ll = d["l"].rolling(acc_len).min().to_numpy()
+    lo20 = d["l"].rolling(20).min().to_numpy()
+    hi20 = d["h"].rolling(20).max().to_numpy()
+    cprev = d["c"].shift(1)
+    ema_dir = np.where(cprev.ewm(span=20, adjust=False).mean() > cprev.ewm(span=50, adjust=False).mean(), 1, -1)
+    tgy_rr, tgy_mult = _tgy_targets(c)
+    n = len(d)
+    trades = []
+    state, i = 0, 0
+    acc_top = acc_bot = None
+    acc_end = 0
+    while i < n - 1:
+        a = atr50[i]
+        if np.isnan(hh[i]) or np.isnan(a):
+            i += 1
+            continue
+        if state == 0 and hh[i] - ll[i] <= acc_mult * a:
+            state, acc_end = 1, i
+            acc_top, acc_bot = hh[i] + 0.5 * a, ll[i] - 0.5 * a
+        if state == 1:
+            if h[i] > acc_top or l[i] < acc_bot:
+                state = 2
+            else:
+                acc_end = i
+        direction = 0
+        if state == 2 and i > acc_end:
+            if h[i] > acc_top + manip_mult * a:
+                direction = -1
+            elif l[i] < acc_bot - manip_mult * a:
+                direction = 1
+        if direction == 0:
+            i += 1
+            continue
+        state = 0
+        if echo_direction(c, i) != direction or (variant == "Plot+EMA" and ema_dir[i] != direction):
+            i += 1
+            continue
+        j = i + 1
+        entry = ao[j] if direction == 1 else bo[j]
+        b = atr14[i]
+        if variant == "Base":
+            risk, rr = PO3_SL_ATR * a, PO3_RR
+        elif variant == "ATR2.5":
+            risk, rr = 2.5 * b, 1.0
+        elif variant in ("Plot TP2", "Plot+EMA"):
+            risk, rr = 1.5 * b, 2.0 / 1.5
+        else:  # TGY
+            sl0 = (lo20[i] - 0.25 * b) if direction == 1 else (hi20[i] + 0.25 * b)
+            risk = direction * (entry - sl0)
+            rr = float(tgy_rr[i] * tgy_mult[i]) if not np.isnan(tgy_mult[i]) else 1.5
+        if not (risk > 0) or np.isnan(risk):
+            i = j
+            continue
+        sl = entry - direction * risk
+        tp = entry + direction * rr * risk
+        r, k = _fixed_exit(direction, j, entry, sl, tp, rr, risk, bh, bl, bc, ah, al, ac, n)
+        if start_ts <= t[j] < end_ts:
+            trades.append({"pair": pair, "entry": t[j], "exit": t[k], "dir": direction, "r": float(r), "rr": rr,
+                           "risk_pips": risk / pip(pair), "spread_frac": (ao[j] - bo[j]) / risk})
+        i = k + 1
+    return trades
+
+
+def run_backtest_po3tools(api, days):
+    now = datetime.now(timezone.utc)
+    end = now - timedelta(days=BACKTEST_END_DAYS)
+    start = end - timedelta(days=days)
+    start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+    log.info(f"BACKTEST | PO3 + Echo with ATR / TrendGenY stops and targets | {TIMEFRAME} | "
+             f"{start:%Y-%m-%d} to {end:%Y-%m-%d} | {len(PO3W_PAIRS)} pairs")
+    names = ["Base", "ATR2.5", "Plot TP2", "Plot+EMA", "TGY"]
+    rows = {k: [] for k in names}
+    for pair in PO3W_PAIRS:
+        try:
+            d = fetch_range(api, pair, TIMEFRAME, start - timedelta(days=60))
+            d = d[d["time"] < end_ts].reset_index(drop=True)
+            if len(d) < 300:
+                log.info(f"{pair} | not enough history, skipped")
+                continue
+            for v in names:
+                rows[v] += simulate_po3_tools(d, pair, start_ts, end_ts, v)
+            log.info(f"{pair} | done")
+            del d
+            gc.collect()
+        except Exception as e:
+            log.error(f"{pair} | BACKTEST ERROR | {e}")
+
+    log.info("")
+    log.info(f"===== PO3+ECHO + RISK TOOLS | {TIMEFRAME} | {start:%Y} to {end:%Y} | results in R =====")
+    log.info(f"{'':<8}{'n':>5}{'win':>6}{'avgR':>6}{'PF':>5}{'1st':>6}{'2nd':>6}")
+    for name, tr in rows.items():
+        log.info(_summary_line(name, tr))
+    for name, tr in rows.items():
+        if not tr:
+            continue
+        per = {}
+        for x in tr:
+            per.setdefault(x["pair"], []).append(x["r"])
+        pos = sum(1 for v in per.values() if np.mean(v) > 0)
+        cf = np.mean([1 / (1 + x["rr"]) for x in tr]) * 100
+        log.info(f"{name}: coin flip {cf:.0f}% | {pos} of {len(per)} pairs positive | avg stop "
+                 f"{np.mean([x['risk_pips'] for x in tr]):.1f} pips | spread {np.mean([x['spread_frac'] for x in tr]) * 100:.1f}% of risk")
+    log.info("Pass: avgR > 0 in BOTH halves, PF >= 1.2, 300+ trades, most pairs positive - and better than Base.")
+    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+
+
+# ----------------------------------------------------------------------------
+# BACKTEST: "TD Forex Breakout - M15" + every lesson from this project (rules fixed before testing)
+#   The script: EMA50 > EMA200 and close > EMA50 (or the mirror for shorts), candle closes beyond the prior
+#   20-candle high/low, tick volume above its 20-candle average. Stop 1.5 x ATR(14). Three take-profits at
+#   1R / 2R / 3R closing 33% / 33% / 34%; the stop stays where it is. Entry at the next candle's open
+#   (the script fills at the signal candle's close, which can't really be done). One position at a time.
+#   Rows:
+#     Script   = exactly as written
+#     1:2      = same entries, one target at 2R (clean coin-flip comparison: 33%)
+#     Overlap  = script, but only signals between 08:00 and 12:00 New York (tightest spreads of the day)
+#     Wide     = script, stop 3 x ATR (spread becomes half the share of risk)
+#     All      = Wide + Overlap: every cost lesson applied together
+#   Pass: avgR > 0 in BOTH halves, PF >= 1.2, 300+ trades, most pairs positive. Then confirm on untouched
+#   years (BACKTEST_END_DAYS) before anything goes to the demo account.
+# ----------------------------------------------------------------------------
+BRK_PAIRS = [p.strip().upper() for p in os.getenv(
+    "BRK_PAIRS", "EUR_USD,GBP_USD,USD_JPY,AUD_USD,USD_CAD,EUR_JPY").split(",") if p.strip()]
+
+
+def _partial_exit(dirn, j, entry, risk, rrs, wts, bh, bl, bc, ah, al, ac, n):
+    sl = entry - dirn * risk
+    tps = [entry + dirn * rr * risk for rr in rrs]
+    open_legs = list(range(len(rrs)))
+    r = 0.0
+    end = min(j + SB_MAX_BARS, n - 1)
+    k = j
+    for k in range(j, end + 1):
+        lo_, hi_ = (bl[k], bh[k]) if dirn == 1 else (al[k], ah[k])
+        if (dirn == 1 and lo_ <= sl) or (dirn == -1 and hi_ >= sl):
+            r += sum(-wts[g] for g in open_legs)          # stop first if both touched in one candle
+            return r, k
+        for g in list(open_legs):
+            if (dirn == 1 and hi_ >= tps[g]) or (dirn == -1 and lo_ <= tps[g]):
+                r += wts[g] * rrs[g]
+                open_legs.remove(g)
+        if not open_legs:
+            return r, k
+    px = bc[k] if dirn == 1 else ac[k]
+    r += sum(wts[g] * dirn * (px - entry) / risk for g in open_legs)
+    return r, k
+
+
+def simulate_breakout(d, pair, start_ts, end_ts, variant):
+    t = d["time"].tolist()
+    c, h, l = d["c"].to_numpy(), d["h"].to_numpy(), d["l"].to_numpy()
+    bo, bh, bl, bc = (d[k].to_numpy() for k in ("bo", "bh", "bl", "bc"))
+    ao, ah, al, ac = (d[k].to_numpy() for k in ("ao", "ah", "al", "ac"))
+    ef = d["c"].ewm(span=50, adjust=False).mean().to_numpy()
+    es = d["c"].ewm(span=200, adjust=False).mean().to_numpy()
+    atr = calc_atr(d, 14).to_numpy()
+    res = d["h"].rolling(20).max().shift(1).to_numpy()
+    sup = d["l"].rolling(20).min().shift(1).to_numpy()
+    vol = d["volume"].astype(float)
+    vok = (vol > vol.rolling(20).mean()).to_numpy()
+    ny = d["time"].dt.tz_convert("America/New_York")
+    mod = (ny.dt.hour * 60 + ny.dt.minute).to_numpy()
+    overlap_only = variant in ("Overlap", "All")
+    stop_mult = 3.0 if variant in ("Wide", "All") else 1.5
+    rrs, wts = ([2.0], [1.0]) if variant == "1:2" else ([1.0, 2.0, 3.0], [0.33, 0.33, 0.34])
+    n = len(d)
+    trades = []
+    i = 200
+    while i < n - 1:
+        if np.isnan(res[i]) or np.isnan(atr[i]) or atr[i] <= 0 or not vok[i]:
+            i += 1
+            continue
+        if overlap_only and not (480 <= mod[i] < 720):
+            i += 1
+            continue
+        dirn = 0
+        if ef[i] > es[i] and c[i] > ef[i] and c[i] > res[i]:
+            dirn = 1
+        elif ef[i] < es[i] and c[i] < ef[i] and c[i] < sup[i]:
+            dirn = -1
+        if dirn == 0:
+            i += 1
+            continue
+        j = i + 1
+        entry = ao[j] if dirn == 1 else bo[j]
+        risk = stop_mult * atr[i]
+        r, k = _partial_exit(dirn, j, entry, risk, rrs, wts, bh, bl, bc, ah, al, ac, n)
+        if start_ts <= t[j] < end_ts:
+            trades.append({"pair": pair, "entry": t[j], "exit": t[k], "dir": dirn, "r": float(r),
+                           "risk_pips": risk / pip(pair), "spread_frac": (ao[j] - bo[j]) / risk})
+        i = k + 1
+    return trades
+
+
+def run_backtest_breakout(api, days):
+    now = datetime.now(timezone.utc)
+    end = now - timedelta(days=BACKTEST_END_DAYS)
+    start = end - timedelta(days=days)
+    start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+    log.info(f"BACKTEST | TD Forex Breakout + lessons | {TIMEFRAME} | {start:%Y-%m-%d} to {end:%Y-%m-%d} | "
+             f"pairs {BRK_PAIRS}")
+    names = ["Script", "1:2", "Overlap", "Wide", "All"]
+    rows = {k: [] for k in names}
+    for pair in BRK_PAIRS:
+        try:
+            d = fetch_range(api, pair, TIMEFRAME, start - timedelta(days=15))
+            d = d[d["time"] < end_ts].reset_index(drop=True)
+            if len(d) < 1000:
+                log.info(f"{pair} | not enough history, skipped")
+                continue
+            for v in names:
+                rows[v] += simulate_breakout(d, pair, start_ts, end_ts, v)
+            log.info(f"{pair} | done")
+            del d
+            gc.collect()
+        except Exception as e:
+            log.error(f"{pair} | BACKTEST ERROR | {e}")
+
+    log.info("")
+    log.info(f"===== TD BREAKOUT + LESSONS | {TIMEFRAME} | {start:%Y} to {end:%Y} | results in R =====")
+    log.info(f"{'':<8}{'n':>5}{'win':>6}{'avgR':>6}{'PF':>5}{'1st':>6}{'2nd':>6}")
+    for name, tr in rows.items():
+        log.info(_summary_line(name, tr))
+    months = max(days / 30.4, 1)
+    for name, tr in rows.items():
+        if not tr:
+            continue
+        per = {}
+        for x in tr:
+            per.setdefault(x["pair"], []).append(x["r"])
+        pos = sum(1 for v in per.values() if np.mean(v) > 0)
+        log.info(f"{name}: {pos} of {len(per)} pairs positive | avg stop {np.mean([x['risk_pips'] for x in tr]):.1f} pips | "
+                 f"spread {np.mean([x['spread_frac'] for x in tr]) * 100:.1f}% of risk | {len(tr) / months:.0f} trades/month")
+    log.info("Script/Overlap/Wide/All use 3 partial targets: judge them by avgR and PF, not win rate. 1:2 coin flip = 33%.")
+    log.info("Pass: avgR > 0 in BOTH halves, PF >= 1.2, 300+ trades, most pairs positive. Then confirm on untouched years.")
+    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+
+
+# ----------------------------------------------------------------------------
 # LIVE
 # ----------------------------------------------------------------------------
 _NEWS = {"t": 0.0, "events": None}
@@ -3502,6 +3782,10 @@ def main():
             run_backtest_sax(api, days)
         elif strategy == "xgb":
             run_backtest_xgb(api, days)
+        elif strategy == "po3tools":
+            run_backtest_po3tools(api, days)
+        elif strategy == "brk":
+            run_backtest_breakout(api, days)
         else:
             run_backtest(api, days)
         while True:  # idle so Railway does not keep re-running it
