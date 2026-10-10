@@ -16,6 +16,7 @@ Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
          BACKTEST_STRATEGY=smc  backtests YOUR strategy: H4+H1+M15 trend aligned, break of structure,
                                 entry on the pullback into the fair value gap / retest, structural stop
          BACKTEST_STRATEGY=smce tests 3 entries for your strategy: limit pullback vs market at the break vs confirmation candle
+        BACKTEST_STRATEGY=po3v2 tests Power Of Three + trend filter + confirmation (break of structure, market entry)
         BACKTEST_STRATEGY=combo backtests your strategy + Power Of Three together (fake move against the
                                 H4/H1 trend, then your break of structure back with it)
          BACKTEST_END_DAYS=N   ends the test window N days ago (to test an untouched past period)
@@ -837,7 +838,7 @@ OB_SL_PAD_ATR = _f("OB_SL_PAD_ATR", 0.1)
 OB_RRS = [float(x) for x in os.getenv("OB_RRS", "1,2,3").split(",") if x.strip()]
 
 
-def simulate_po3(d, pair, start_ts):
+def simulate_po3(d, pair, start_ts, tr1=None, tr4=None):
     acc_len, acc_mult, manip_mult = PO3_PRESETS.get(PO3_MODE, PO3_PRESETS["small"])
     t = d["time"].tolist()
     h, l = d["h"].to_numpy(), d["l"].to_numpy()
@@ -871,6 +872,9 @@ def simulate_po3(d, pair, start_ts):
                 direction = -1
             elif l[i] < acc_bot - manip_mult * a:
                 direction = 1
+        if direction != 0 and tr1 is not None and not (tr1[i] == direction and tr4[i] == direction):
+            state = 0                       # trend filter: the fake move did not go against the H4+H1 trend
+            direction = 0
         if direction == 0:
             i += 1
             continue
@@ -2081,7 +2085,7 @@ def run_backtest_smce(api, days):
 COMBO_BOS_WINDOW = _i("COMBO_BOS_WINDOW", 20)
 
 
-def simulate_combo(d, pair, start_ts, end_ts, ctx, rr):
+def simulate_combo(d, pair, start_ts, end_ts, ctx, rr, entry_mode="limit"):
     acc_len, acc_mult, manip_mult = PO3_PRESETS["small"]
     t = d["time"].tolist()
     h, l, c = d["h"].to_numpy(), d["l"].to_numpy(), d["c"].to_numpy()
@@ -2130,13 +2134,20 @@ def simulate_combo(d, pair, start_ts, end_ts, ctx, rr):
                 pos = None
         # 2) pending pullback entry
         elif pos is None and pending is not None and i > pending["created"]:
-            if i - pending["created"] > SMC_WAIT:
+            if pending.get("mode") == "market" and blocked[i]:
+                count["entry not reached"] += 1
+                pending = None
+            elif i - pending["created"] > SMC_WAIT:
                 count["entry not reached"] += 1
                 pending = None
             elif not blocked[i]:
                 dirn, E = pending["dir"], pending["entry"]
-                if (dirn == 1 and al[i] <= E) or (dirn == -1 and bh[i] >= E):
-                    fill = min(E, ao[i]) if dirn == 1 else max(E, bo[i])
+                market = pending.get("mode") == "market"
+                if market or (dirn == 1 and al[i] <= E) or (dirn == -1 and bh[i] >= E):
+                    if market:
+                        fill = ao[i] if dirn == 1 else bo[i]      # next candle's open, paying the spread
+                    else:
+                        fill = min(E, ao[i]) if dirn == 1 else max(E, bo[i])
                     sl = pending["sl"]
                     risk = dirn * (fill - sl)
                     if risk < minr:
@@ -2188,7 +2199,9 @@ def simulate_combo(d, pair, start_ts, end_ts, ctx, rr):
                         break
                 E = lvl if gap is None else (max(lvl, gap) if dirn == 1 else min(lvl, gap))
                 setup = None
-                if dirn * (c[i] - E) > 0 and dirn * (E - ext) > 0:
+                if entry_mode == "market":
+                    pending = {"dir": dirn, "entry": c[i], "sl": ext - dirn * 0.1 * atr[i], "created": i, "mode": "market"}
+                elif dirn * (c[i] - E) > 0 and dirn * (E - ext) > 0:
                     pending = {"dir": dirn, "entry": E, "sl": ext - dirn * 0.1 * atr[i], "created": i}
                 continue
             if i > setup["deadline"]:
@@ -2265,6 +2278,62 @@ def run_backtest_combo(api, days):
         log.info(f"Combo 1:3: average stop {np.mean([x['risk_pips'] for x in base]):.1f} pips, spread "
                  f"{np.mean([x['spread_frac'] for x in base]) * 100:.1f}% of risk, about {len(base) / max(days / 30.4, 1):.1f} trades a month")
     log.info("Need: avgR above 0 in BOTH halves, PF above 1.2, a few hundred trades.")
+    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+
+
+# ----------------------------------------------------------------------------
+# BACKTEST: Power Of Three v2 (rules fixed before testing)
+#   PO3      = plain Power Of Three (fade the fake move at once, target 0.86R) - reference
+#   PO3+Tr   = same, but only fade fake moves that went AGAINST the H4+H1 trend
+#   Conf1:2 / Conf1:3 = PO3 + trend + confirmation: wait (up to COMBO_BOS_WINDOW candles) for an M15
+#              break of structure back in the fade direction, enter at the NEXT candle's open (market,
+#              no pullback limit), stop beyond the fake move's extreme (+0.1 ATR, min 15 pips)
+#   Pass: avgR > 0 in BOTH halves, PF >= 1.2, a few hundred trades -> then confirm on untouched data.
+# ----------------------------------------------------------------------------
+def run_backtest_po3v2(api, days):
+    now = datetime.now(timezone.utc)
+    end = now - timedelta(days=BACKTEST_END_DAYS)
+    start = end - timedelta(days=days)
+    start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+    log.info(f"BACKTEST | Power Of Three v2 (trend filter + confirmation) | {TIMEFRAME} | "
+             f"{start:%Y-%m-%d} to {end:%Y-%m-%d} | pairs {SMC_PAIRS}")
+    rows = {"PO3": [], "PO3+Tr": [], "Conf1:2": [], "Conf1:3": []}
+    counts = {}
+    for pair in SMC_PAIRS:
+        try:
+            m15 = fetch_range(api, pair, TIMEFRAME, start - timedelta(days=10))
+            h1 = fetch_range(api, pair, "H1", start - timedelta(days=40))
+            h4 = fetch_range(api, pair, "H4", start - timedelta(days=120))
+            if len(m15) < 500 or len(h1) < 100 or len(h4) < 100:
+                log.info(f"{pair} | not enough history, skipped")
+                continue
+            ctx = build_smc_ctx(m15, h1, h4)
+            rows["PO3"] += [x for x in simulate_po3(m15, pair, start_ts) if x["entry"] < end_ts]
+            rows["PO3+Tr"] += [x for x in simulate_po3(m15, pair, start_ts, ctx["tr1"], ctx["tr4"]) if x["entry"] < end_ts]
+            for rr in (2.0, 3.0):
+                tr, cnt = simulate_combo(m15, pair, start_ts, end_ts, ctx, rr, "market")
+                rows[f"Conf1:{rr:g}"] += tr
+                if rr == 2.0:
+                    for k2, v in cnt.items():
+                        counts[k2] = counts.get(k2, 0) + v
+            log.info(f"{pair} | done")
+        except Exception as e:
+            log.error(f"{pair} | BACKTEST ERROR | {e}")
+
+    log.info("")
+    log.info(f"===== PO3 v2 | {TIMEFRAME} | {start:%Y} to {end:%Y} | results in R =====")
+    log.info(f"{'':<8}{'n':>5}{'win':>6}{'avgR':>6}{'PF':>5}{'1st':>6}{'2nd':>6}")
+    for name, tr in rows.items():
+        log.info(_summary_line(name, tr))
+    log.info(f"Coin-flip win rates to beat: PO3 and PO3+Tr ({PO3_RR:g}R target) = {100 / (1 + PO3_RR):.0f}%, "
+             f"Conf1:2 = 33%, Conf1:3 = 25% (before spread).")
+    months = max(days / 30.4, 1)
+    for name, tr in rows.items():
+        if tr:
+            log.info(f"{name}: avg stop {np.mean([x['risk_pips'] for x in tr]):.1f} pips, spread "
+                     f"{np.mean([x['spread_frac'] for x in tr]) * 100:.1f}% of risk, {len(tr) / months:.1f} trades/month")
+    log.info("Conf setups: " + ", ".join(f"{k2} {v}" for k2, v in counts.items()))
+    log.info("Pass: avgR > 0 in BOTH halves, PF >= 1.2, a few hundred trades. Then confirm on untouched data.")
     log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
 
 
@@ -2552,6 +2621,8 @@ def main():
             run_backtest_combo(api, days)
         elif strategy == "smce":
             run_backtest_smce(api, days)
+        elif strategy == "po3v2":
+            run_backtest_po3v2(api, days)
         else:
             run_backtest(api, days)
         while True:  # idle so Railway does not keep re-running it
