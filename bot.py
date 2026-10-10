@@ -37,6 +37,7 @@ Backtest: set Railway variable MODE=backtest (optionally BACKTEST_DAYS=180 and
           Test another timeframe with TIMEFRAME=H1 (or H4), e.g. BACKTEST_DAYS=365.
 """
 import logging
+import gc
 import os
 import sys
 import time
@@ -224,7 +225,9 @@ def fetch_recent(api, pair, gran, count):
 
 
 def fetch_range(api, pair, gran, start):
-    raw_all = []
+    """Download candles from start to now in chunks of 5000. Each chunk is turned into a compact table right
+    away (the raw JSON for years of M15 data is huge and used to run the server out of memory)."""
+    parts = []
     cur = start
     while True:
         data = api.get(
@@ -239,15 +242,20 @@ def fetch_range(api, pair, gran, start):
         raw = data.get("candles", [])
         if not raw:
             break
-        raw_all.extend(raw)
-        if len(raw) < 5000:
+        last_time = raw[-1]["time"]
+        got = len(raw)
+        df = parse_candles(raw)
+        del raw, data
+        if not df.empty:
+            parts.append(df)
+        if got < 5000:
             break
-        cur = pd.Timestamp(raw[-1]["time"]).to_pydatetime() + timedelta(seconds=1)
+        cur = pd.Timestamp(last_time).to_pydatetime() + timedelta(seconds=1)
         time.sleep(0.2)
-    return parse_candles(raw_all)
-
-
-_HOME_CONV = {}
+    if not parts:
+        return pd.DataFrame()
+    out = pd.concat(parts, ignore_index=True)
+    return out.drop_duplicates("time").sort_values("time").reset_index(drop=True)
 
 
 def get_prices(api):
@@ -2750,6 +2758,8 @@ def run_scan(api, days):
                         res.setdefault(key, []).extend(
                             [x for x in scan_simulate(d, pair, ent, mod, datr, rr, flip) if x["entry"] >= t0])
             log.info(f"{pair} | done | {len(d)} candles from {d['time'].iloc[0]:%Y-%m-%d}")
+            del d, entries, mod, dly, datr
+            gc.collect()
         except Exception as e:
             log.error(f"{pair} | SCAN ERROR | {e}")
 
