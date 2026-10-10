@@ -13,6 +13,10 @@ Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
          BACKTEST_STRATEGY=po3e backtests Power Of Three + LuxAlgo Echo Forecast
          BACKTEST_STRATEGY=lbo  backtests the London breakout (trade WITH the Asian-range break) vs the fade
          BACKTEST_STRATEGY=po3x tunes Power Of Three + Echo exits (stop beyond the fake move, target the range)
+         BACKTEST_STRATEGY=smc  backtests YOUR strategy: H4+H1+M15 trend aligned, break of structure,
+                                entry on the pullback into the fair value gap / retest, structural stop
+         BACKTEST_STRATEGY=combo backtests your strategy + Power Of Three together (fake move against the
+                                H4/H1 trend, then your break of structure back with it)
          BACKTEST_END_DAYS=N   ends the test window N days ago (to test an untouched past period)
 Safety : live entries are skipped near high-impact news (free Forex Factory feed), in the late New York
          hours, or when one currency is already over-exposed; trades are sized by % risk (RISK_PCT)
@@ -1713,6 +1717,469 @@ def run_backtest_po3x(api, days):
 
 
 # ----------------------------------------------------------------------------
+# BACKTEST: your strategy (rules fixed before testing)
+#   Trend   = H4, H1 and M15 all making higher highs + higher lows (bullish) or lower highs + lower lows
+#             (bearish), judged from the last two confirmed swing highs and lows (3 candles each side)
+#   BOS     = an M15 close beyond the latest swing high (buys) / swing low (sells), in the trend's direction
+#   Entry   = limit order on the pullback: the fair value gap left by the breakout move, or a retest of the
+#             broken level, whichever price reaches first; valid for 8 hours (32 candles)
+#   Stop    = beyond the pullback low/high that launched the break (+0.1 ATR), never tighter than 15 pips
+#   Target  = fixed risk-reward (1:2, 1:3, 1:4 shown side by side)
+#   +Lvl    = the entry must also sit on a key H4 support/resistance level (within 0.5 H4 ATR)
+#   No new entries in the late New York hours. Pairs: EUR_USD, USD_JPY, GBP_USD (SMC_PAIRS to change).
+# ----------------------------------------------------------------------------
+SMC_PAIRS = [p.strip().upper() for p in os.getenv("SMC_PAIRS", "EUR_USD,USD_JPY,GBP_USD").split(",") if p.strip()]
+SMC_SWING = _i("SMC_SWING", 3)
+SMC_WAIT = _i("SMC_WAIT", 32)
+SMC_MIN_STOP_PIPS = _f("SMC_MIN_STOP_PIPS", 15)
+SMC_LEVEL_ATR = 0.5
+
+
+def structure_trend(h, l, n):
+    """+1 = higher highs and higher lows, -1 = lower highs and lower lows, 0 = mixed (confirmed swings only)."""
+    N = len(h)
+    tr = np.zeros(N, dtype=int)
+    sh = [None, None]
+    sl = [None, None]
+    for i in range(N):
+        p = i - n
+        if p - n >= 0:
+            if h[p] > h[p - n:p].max() and h[p] >= h[p + 1:i + 1].max():
+                sh = [sh[1], h[p]]
+            if l[p] < l[p - n:p].min() and l[p] <= l[p + 1:i + 1].min():
+                sl = [sl[1], l[p]]
+        if None not in sh and None not in sl:
+            if sh[1] > sh[0] and sl[1] > sl[0]:
+                tr[i] = 1
+            elif sh[1] < sh[0] and sl[1] < sl[0]:
+                tr[i] = -1
+    return tr
+
+
+def _on_m15(d, frame, values, minutes):
+    """Values from a higher-timeframe frame, known when each M15 candle closes (completed candles only)."""
+    f = pd.DataFrame({"avail": frame["time"] + pd.Timedelta(minutes=minutes), "v": values})
+    ct = (d["time"] + pd.Timedelta(minutes=TF_MIN[TIMEFRAME])).to_frame("ct")
+    m = pd.merge_asof(ct, f.sort_values("avail"), left_on="ct", right_on="avail", direction="backward")
+    return m["v"].to_numpy()
+
+
+def h4_levels(h4, n):
+    """Confirmed H4 swing highs/lows as (time the swing became known, price), sorted by time."""
+    h, l = h4["h"].to_numpy(), h4["l"].to_numpy()
+    times = h4["time"].tolist()
+    out_t, out_p = [], []
+    for i in range(len(h4)):
+        p = i - n
+        if p - n >= 0:
+            known = (times[i] + pd.Timedelta(hours=4)).value
+            if h[p] > h[p - n:p].max() and h[p] >= h[p + 1:i + 1].max():
+                out_t.append(known)
+                out_p.append(h[p])
+            if l[p] < l[p - n:p].min() and l[p] <= l[p + 1:i + 1].min():
+                out_t.append(known)
+                out_p.append(l[p])
+    return np.array(out_t, dtype=np.int64), np.array(out_p)
+
+
+def simulate_smc(d, pair, start_ts, end_ts, ctx, rr, use_level):
+    t = d["time"].tolist()
+    h, l, c = d["h"].to_numpy(), d["l"].to_numpy(), d["c"].to_numpy()
+    bo, bh, bl, bc = (d[k].to_numpy() for k in ("bo", "bh", "bl", "bc"))
+    ao, ah, al, ac = (d[k].to_numpy() for k in ("ao", "ah", "al", "ac"))
+    atr = calc_atr(d, 14).to_numpy()
+    tr15, tr1, tr4, atr4 = ctx["tr15"], ctx["tr1"], ctx["tr4"], ctx["atr4"]
+    lvl_t, lvl_p, ct_ns, blocked = ctx["lvl_t"], ctx["lvl_p"], ctx["ct_ns"], ctx["blocked"]
+    n = len(d)
+    S = SMC_SWING
+    minr = SMC_MIN_STOP_PIPS * pip(pair)
+    trades = []
+    skip = {"expired": 0, "spread": 0, "no key level": 0}
+    sh_p = sh_i = sl_p = sl_i = None
+    sh_done = sl_done = True
+    pending = pos = None
+
+    def record(p, i, r):
+        if p["record"]:
+            trades.append({"pair": pair, "entry": p["t"], "exit": t[i], "dir": p["dir"], "r": float(r),
+                           "risk_pips": p["risk"] / pip(pair), "spread_frac": p["spread"] / p["risk"]})
+
+    def near_level(price, i):
+        if len(lvl_t) == 0 or np.isnan(atr4[i]):
+            return False
+        hi = np.searchsorted(lvl_t, ct_ns[i], side="right")
+        lo = np.searchsorted(lvl_t, ct_ns[i] - 30 * 86400 * 10**9)
+        return bool(len(lvl_p[lo:hi])) and np.min(np.abs(lvl_p[lo:hi] - price)) <= SMC_LEVEL_ATR * atr4[i]
+
+    for i in range(n):
+        # 1) manage the open trade
+        if pos is not None and i > pos["fill"]:
+            r = None
+            if pos["dir"] == 1:
+                if bl[i] <= pos["sl"]:
+                    r = -1.0
+                elif bh[i] >= pos["tp"]:
+                    r = rr
+            else:
+                if ah[i] >= pos["sl"]:
+                    r = -1.0
+                elif al[i] <= pos["tp"]:
+                    r = rr
+            if r is None and i - pos["fill"] >= SB_MAX_BARS:
+                r = pos["dir"] * ((bc[i] if pos["dir"] == 1 else ac[i]) - pos["entry"]) / pos["risk"]
+            if r is not None:
+                record(pos, i, r)
+                pos = None
+        # 2) pending limit order on the pullback
+        elif pos is None and pending is not None and i > pending["created"]:
+            if i - pending["created"] > SMC_WAIT:
+                skip["expired"] += 1
+                pending = None
+            elif not blocked[i]:
+                dirn, E = pending["dir"], pending["entry"]
+                if (dirn == 1 and al[i] <= E) or (dirn == -1 and bh[i] >= E):
+                    fill = min(E, ao[i]) if dirn == 1 else max(E, bo[i])
+                    sl = pending["sl"]
+                    risk = dirn * (fill - sl)
+                    if risk < minr:
+                        risk = minr
+                        sl = fill - dirn * risk
+                    spread = ao[i] - bo[i]
+                    pending = None
+                    if spread > MAX_SPREAD_RISK * risk:
+                        skip["spread"] += 1
+                    else:
+                        p = {"dir": dirn, "entry": fill, "sl": sl, "tp": fill + dirn * rr * risk, "risk": risk,
+                             "fill": i, "t": t[i], "spread": spread, "record": start_ts <= t[i] < end_ts}
+                        if (dirn == 1 and bl[i] <= sl) or (dirn == -1 and ah[i] >= sl):
+                            record(p, i, -1.0)      # filled and stopped in the same candle: count the loss
+                        else:
+                            pos = p
+        # 3) swings confirmed this candle
+        q = i - S
+        if q - S >= 0:
+            if h[q] > h[q - S:q].max() and h[q] >= h[q + 1:i + 1].max():
+                sh_p, sh_i, sh_done = h[q], q, False
+            if l[q] < l[q - S:q].min() and l[q] <= l[q + 1:i + 1].min():
+                sl_p, sl_i, sl_done = l[q], q, False
+        # 4) break of structure
+        for dirn in (1, -1):
+            lvl, idx, done = (sh_p, sh_i, sh_done) if dirn == 1 else (sl_p, sl_i, sl_done)
+            if lvl is None or done or not ((dirn == 1 and c[i] > lvl) or (dirn == -1 and c[i] < lvl)):
+                continue
+            if dirn == 1:
+                sh_done = True
+            else:
+                sl_done = True
+            if pending is not None and pending["dir"] != dirn:
+                pending = None                      # structure broke the other way: cancel
+            if pos is not None or pending is not None or np.isnan(atr[i]):
+                continue
+            if not (tr15[i] == dirn and tr1[i] == dirn and tr4[i] == dirn):
+                continue
+            seg = slice(idx, i + 1)
+            launch = idx + (int(np.argmin(l[seg])) if dirn == 1 else int(np.argmax(h[seg])))
+            stop_ref = l[launch] if dirn == 1 else h[launch]
+            gap = None
+            for k in range(i, launch + 1, -1):     # newest fair value gap in the breakout move
+                if k - 2 < launch:
+                    break
+                if dirn == 1 and l[k] > h[k - 2]:
+                    gap = l[k]
+                    break
+                if dirn == -1 and h[k] < l[k - 2]:
+                    gap = h[k]
+                    break
+            E = lvl if gap is None else (max(lvl, gap) if dirn == 1 else min(lvl, gap))
+            if dirn * (c[i] - E) <= 0 or dirn * (E - stop_ref) <= 0:
+                continue
+            if use_level and not near_level(E, i):
+                skip["no key level"] += 1
+                continue
+            pending = {"dir": dirn, "entry": E, "sl": stop_ref - dirn * 0.1 * atr[i], "created": i}
+    if pos is not None:
+        record(pos, n - 1, pos["dir"] * ((bc[n - 1] if pos["dir"] == 1 else ac[n - 1]) - pos["entry"]) / pos["risk"])
+    return trades, skip
+
+
+def build_smc_ctx(m15, h1, h4):
+    lt = m15["time"].dt.tz_convert("America/New_York")
+    nym = (lt.dt.hour * 60 + lt.dt.minute).to_numpy()
+    a, b = (NY_BLOCK or "0:0-0:0").split("-")
+    s0 = int(a.split(":")[0]) * 60 + int(a.split(":")[1])
+    e0 = int(b.split(":")[0]) * 60 + int(b.split(":")[1])
+    ctx = {
+        "tr15": structure_trend(m15["h"].to_numpy(), m15["l"].to_numpy(), SMC_SWING),
+        "tr1": np.nan_to_num(_on_m15(m15, h1, structure_trend(h1["h"].to_numpy(), h1["l"].to_numpy(), SMC_SWING), 60)).astype(int),
+        "tr4": np.nan_to_num(_on_m15(m15, h4, structure_trend(h4["h"].to_numpy(), h4["l"].to_numpy(), SMC_SWING), 240)).astype(int),
+        "atr4": _on_m15(m15, h4, calc_atr(h4, 14).to_numpy(), 240),
+        "ct_ns": np.array([(x + pd.Timedelta(minutes=TF_MIN[TIMEFRAME])).value for x in m15["time"]], dtype=np.int64),
+        "blocked": (nym >= s0) & (nym < e0),
+    }
+    ctx["lvl_t"], ctx["lvl_p"] = h4_levels(h4, SMC_SWING)
+    return ctx
+
+
+def run_backtest_smc(api, days):
+    now = datetime.now(timezone.utc)
+    end = now - timedelta(days=BACKTEST_END_DAYS)
+    start = end - timedelta(days=days)
+    start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+    log.info(f"BACKTEST | your strategy (trend x3 + BOS + FVG/retest) | {TIMEFRAME} | {start:%Y-%m-%d} to {end:%Y-%m-%d} | pairs {SMC_PAIRS}")
+    variants = {"1:2": (2.0, False), "1:3": (3.0, False), "1:4": (4.0, False), "1:3 +Lvl": (3.0, True)}
+    rows = {k: [] for k in variants}
+    skips = {k: {} for k in variants}
+    for pair in SMC_PAIRS:
+        try:
+            m15 = fetch_range(api, pair, TIMEFRAME, start - timedelta(days=10))
+            h1 = fetch_range(api, pair, "H1", start - timedelta(days=40))
+            h4 = fetch_range(api, pair, "H4", start - timedelta(days=120))
+            if len(m15) < 500 or len(h1) < 100 or len(h4) < 100:
+                log.info(f"{pair} | not enough history, skipped")
+                continue
+            lt = m15["time"].dt.tz_convert("America/New_York")
+            nym = (lt.dt.hour * 60 + lt.dt.minute).to_numpy()
+            a, b = (NY_BLOCK or "0:0-0:0").split("-")
+            s0 = int(a.split(":")[0]) * 60 + int(a.split(":")[1])
+            e0 = int(b.split(":")[0]) * 60 + int(b.split(":")[1])
+            ctx = {
+                "tr15": structure_trend(m15["h"].to_numpy(), m15["l"].to_numpy(), SMC_SWING),
+                "tr1": _on_m15(m15, h1, structure_trend(h1["h"].to_numpy(), h1["l"].to_numpy(), SMC_SWING), 60),
+                "tr4": _on_m15(m15, h4, structure_trend(h4["h"].to_numpy(), h4["l"].to_numpy(), SMC_SWING), 240),
+                "atr4": _on_m15(m15, h4, calc_atr(h4, 14).to_numpy(), 240),
+                "ct_ns": np.array([(x + pd.Timedelta(minutes=TF_MIN[TIMEFRAME])).value for x in m15["time"]], dtype=np.int64),
+                "blocked": (nym >= s0) & (nym < e0),
+            }
+            ctx["tr1"] = np.nan_to_num(ctx["tr1"]).astype(int)
+            ctx["tr4"] = np.nan_to_num(ctx["tr4"]).astype(int)
+            ctx["lvl_t"], ctx["lvl_p"] = h4_levels(h4, SMC_SWING)
+            for name, (rr, use_lvl) in variants.items():
+                tr, sk = simulate_smc(m15, pair, start_ts, end_ts, ctx, rr, use_lvl)
+                rows[name] += tr
+                for k2, v in sk.items():
+                    skips[name][k2] = skips[name].get(k2, 0) + v
+            log.info(f"{pair} | done | 1:3: {sum(1 for x in rows['1:3'] if x['pair'] == pair)} trades")
+        except Exception as e:
+            log.error(f"{pair} | BACKTEST ERROR | {e}")
+
+    log.info("")
+    log.info(f"===== YOUR STRATEGY | {TIMEFRAME} | {start:%Y} to {end:%Y} | results in R =====")
+    log.info(f"{'':<8}{'n':>5}{'win':>6}{'avgR':>6}{'PF':>5}{'1st':>6}{'2nd':>6}")
+    for name, tr in rows.items():
+        log.info(_summary_line(name, tr))
+    log.info("Coin-flip win rates to beat: 1:2 = 33%, 1:3 = 25%, 1:4 = 20% (before spread).")
+    base = rows["1:3"]
+    if base:
+        months = max(days / 30.4, 1)
+        log.info(f"1:3: average stop {np.mean([x['risk_pips'] for x in base]):.1f} pips, spread "
+                 f"{np.mean([x['spread_frac'] for x in base]) * 100:.1f}% of risk, about {len(base) / months:.1f} trades a month")
+    sk = skips["1:3 +Lvl"]
+    log.info("Setups not taken (1:3 +Lvl): " + (", ".join(f"{k2} {v}" for k2, v in sk.items() if v) or "none"))
+    log.info("Need: avgR above 0 in BOTH halves, PF above 1.2, a few hundred trades.")
+    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+
+
+# ----------------------------------------------------------------------------
+# BACKTEST: your strategy + Power Of Three combined (rules fixed before testing)
+#   1. H4 and H1 trends agree (higher highs + higher lows for buys, the reverse for sells)
+#   2. Power Of Three finds a quiet range (40 candles under 5 ATR) and a fake move out of it that goes
+#      AGAINST that trend (a sweep below the range in an uptrend, above it in a downtrend)
+#   3. Within 5 hours (20 candles) an M15 break of structure back in the trend's direction (your rule)
+#   4. Entry on the pullback into the fair value gap / retest (your rule), valid 8 hours
+#   5. Stop beyond the fake move's extreme (+0.1 ATR, at least 15 pips); target 1:3 (1:2 and 1:4 shown)
+#   No entries in the late New York hours; one trade at a time per pair.
+# ----------------------------------------------------------------------------
+COMBO_BOS_WINDOW = _i("COMBO_BOS_WINDOW", 20)
+
+
+def simulate_combo(d, pair, start_ts, end_ts, ctx, rr):
+    acc_len, acc_mult, manip_mult = PO3_PRESETS["small"]
+    t = d["time"].tolist()
+    h, l, c = d["h"].to_numpy(), d["l"].to_numpy(), d["c"].to_numpy()
+    bo, bh, bl, bc = (d[k].to_numpy() for k in ("bo", "bh", "bl", "bc"))
+    ao, ah, al, ac = (d[k].to_numpy() for k in ("ao", "ah", "al", "ac"))
+    atr50 = calc_atr(d, 50).to_numpy()
+    atr = calc_atr(d, 14).to_numpy()
+    hh = d["h"].rolling(acc_len).max().to_numpy()
+    ll = d["l"].rolling(acc_len).min().to_numpy()
+    tr1, tr4, blocked = ctx["tr1"], ctx["tr4"], ctx["blocked"]
+    n = len(d)
+    S = SMC_SWING
+    minr = SMC_MIN_STOP_PIPS * pip(pair)
+    trades = []
+    count = {"fake moves": 0, "against trend": 0, "no BOS in time": 0, "entry not reached": 0, "spread": 0}
+    sh_p = sl_p = None
+    pending = pos = None
+    state = 0
+    acc_top = acc_bot = None
+    acc_end = 0
+    setup = None   # waiting for the break of structure: dir, extreme, extreme index, deadline
+
+    def record(p, i, r):
+        if p["record"]:
+            trades.append({"pair": pair, "entry": p["t"], "exit": t[i], "dir": p["dir"], "r": float(r),
+                           "risk_pips": p["risk"] / pip(pair), "spread_frac": p["spread"] / p["risk"]})
+
+    for i in range(n):
+        # 1) open trade
+        if pos is not None and i > pos["fill"]:
+            r = None
+            if pos["dir"] == 1:
+                if bl[i] <= pos["sl"]:
+                    r = -1.0
+                elif bh[i] >= pos["tp"]:
+                    r = rr
+            else:
+                if ah[i] >= pos["sl"]:
+                    r = -1.0
+                elif al[i] <= pos["tp"]:
+                    r = rr
+            if r is None and i - pos["fill"] >= SB_MAX_BARS:
+                r = pos["dir"] * ((bc[i] if pos["dir"] == 1 else ac[i]) - pos["entry"]) / pos["risk"]
+            if r is not None:
+                record(pos, i, r)
+                pos = None
+        # 2) pending pullback entry
+        elif pos is None and pending is not None and i > pending["created"]:
+            if i - pending["created"] > SMC_WAIT:
+                count["entry not reached"] += 1
+                pending = None
+            elif not blocked[i]:
+                dirn, E = pending["dir"], pending["entry"]
+                if (dirn == 1 and al[i] <= E) or (dirn == -1 and bh[i] >= E):
+                    fill = min(E, ao[i]) if dirn == 1 else max(E, bo[i])
+                    sl = pending["sl"]
+                    risk = dirn * (fill - sl)
+                    if risk < minr:
+                        risk = minr
+                        sl = fill - dirn * risk
+                    spread = ao[i] - bo[i]
+                    pending = None
+                    if spread > MAX_SPREAD_RISK * risk:
+                        count["spread"] += 1
+                    else:
+                        p = {"dir": dirn, "entry": fill, "sl": sl, "tp": fill + dirn * rr * risk, "risk": risk,
+                             "fill": i, "t": t[i], "spread": spread, "record": start_ts <= t[i] < end_ts}
+                        if (dirn == 1 and bl[i] <= sl) or (dirn == -1 and ah[i] >= sl):
+                            record(p, i, -1.0)
+                        else:
+                            pos = p
+        # 3) swings confirmed this candle
+        q = i - S
+        if q - S >= 0:
+            if h[q] > h[q - S:q].max() and h[q] >= h[q + 1:i + 1].max():
+                sh_p = h[q]
+            if l[q] < l[q - S:q].min() and l[q] <= l[q + 1:i + 1].min():
+                sl_p = l[q]
+        if pos is not None or pending is not None:
+            continue
+        a = atr50[i]
+        if np.isnan(hh[i]) or np.isnan(a) or np.isnan(atr[i]):
+            continue
+        # 4) waiting for your break of structure after the fake move
+        if setup is not None:
+            dirn = setup["dir"]
+            if dirn == 1 and l[i] < setup["ext"]:
+                setup["ext"], setup["ext_i"] = l[i], i
+            if dirn == -1 and h[i] > setup["ext"]:
+                setup["ext"], setup["ext_i"] = h[i], i
+            lvl = sh_p if dirn == 1 else sl_p
+            if lvl is not None and i > setup["ext_i"] and (
+                    (dirn == 1 and c[i] > lvl >= c[i - 1]) or (dirn == -1 and c[i] < lvl <= c[i - 1])):
+                launch, ext = setup["ext_i"], setup["ext"]
+                gap = None
+                for k in range(i, launch + 1, -1):
+                    if k - 2 < launch:
+                        break
+                    if dirn == 1 and l[k] > h[k - 2]:
+                        gap = l[k]
+                        break
+                    if dirn == -1 and h[k] < l[k - 2]:
+                        gap = h[k]
+                        break
+                E = lvl if gap is None else (max(lvl, gap) if dirn == 1 else min(lvl, gap))
+                setup = None
+                if dirn * (c[i] - E) > 0 and dirn * (E - ext) > 0:
+                    pending = {"dir": dirn, "entry": E, "sl": ext - dirn * 0.1 * atr[i], "created": i}
+                continue
+            if i > setup["deadline"]:
+                count["no BOS in time"] += 1
+                setup = None
+            continue
+        # 5) Power Of Three: quiet range, then a fake move out of it
+        if state == 0 and hh[i] - ll[i] <= acc_mult * a:
+            state, acc_end = 1, i
+            acc_top, acc_bot = hh[i] + 0.5 * a, ll[i] - 0.5 * a
+        if state == 1:
+            if h[i] > acc_top or l[i] < acc_bot:
+                state = 2
+            else:
+                acc_end = i
+        if state == 2 and i > acc_end:
+            fade = 0
+            if h[i] > acc_top + manip_mult * a:
+                fade = -1
+            elif l[i] < acc_bot - manip_mult * a:
+                fade = 1
+            if fade != 0:
+                state = 0
+                count["fake moves"] += 1
+                if tr1[i] == fade and tr4[i] == fade:   # the fake move went against the H4/H1 trend
+                    setup = {"dir": fade, "ext": l[i] if fade == 1 else h[i], "ext_i": i,
+                             "deadline": i + COMBO_BOS_WINDOW}
+                else:
+                    count["against trend"] += 1
+    if pos is not None:
+        record(pos, n - 1, pos["dir"] * ((bc[n - 1] if pos["dir"] == 1 else ac[n - 1]) - pos["entry"]) / pos["risk"])
+    return trades, count
+
+
+def run_backtest_combo(api, days):
+    now = datetime.now(timezone.utc)
+    end = now - timedelta(days=BACKTEST_END_DAYS)
+    start = end - timedelta(days=days)
+    start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+    log.info(f"BACKTEST | your strategy + Power Of Three | {TIMEFRAME} | {start:%Y-%m-%d} to {end:%Y-%m-%d} | pairs {SMC_PAIRS}")
+    rows = {"Yours": [], "PO3": [], "Combo1:2": [], "Combo1:3": [], "Combo1:4": []}
+    counts = {}
+    for pair in SMC_PAIRS:
+        try:
+            m15 = fetch_range(api, pair, TIMEFRAME, start - timedelta(days=10))
+            h1 = fetch_range(api, pair, "H1", start - timedelta(days=40))
+            h4 = fetch_range(api, pair, "H4", start - timedelta(days=120))
+            if len(m15) < 500 or len(h1) < 100 or len(h4) < 100:
+                log.info(f"{pair} | not enough history, skipped")
+                continue
+            ctx = build_smc_ctx(m15, h1, h4)
+            rows["Yours"] += simulate_smc(m15, pair, start_ts, end_ts, ctx, 3.0, False)[0]
+            rows["PO3"] += [x for x in simulate_po3(m15, pair, start_ts) if x["entry"] < end_ts]
+            for rr in (2.0, 3.0, 4.0):
+                tr, cnt = simulate_combo(m15, pair, start_ts, end_ts, ctx, rr)
+                rows[f"Combo1:{rr:g}"] += tr
+                if rr == 3.0:
+                    for k2, v in cnt.items():
+                        counts[k2] = counts.get(k2, 0) + v
+            log.info(f"{pair} | done | Combo 1:3: {sum(1 for x in rows['Combo1:3'] if x['pair'] == pair)} trades")
+        except Exception as e:
+            log.error(f"{pair} | BACKTEST ERROR | {e}")
+
+    log.info("")
+    log.info(f"===== YOURS + PO3 | {TIMEFRAME} | {start:%Y} to {end:%Y} | results in R =====")
+    log.info(f"{'':<8}{'n':>5}{'win':>6}{'avgR':>6}{'PF':>5}{'1st':>6}{'2nd':>6}")
+    for name, tr in rows.items():
+        log.info(_summary_line(name, tr))
+    log.info("Yours = your strategy alone (1:3). PO3 = plain Power Of Three. Combo = both together (1:3 is the main one).")
+    log.info("Coin-flip win rates to beat: 1:2 = 33%, 1:3 = 25%, 1:4 = 20% (PO3 targets 0.86R: 54%).")
+    log.info("Combo 1:3 setups: " + ", ".join(f"{k2} {v}" for k2, v in counts.items()))
+    base = rows["Combo1:3"]
+    if base:
+        log.info(f"Combo 1:3: average stop {np.mean([x['risk_pips'] for x in base]):.1f} pips, spread "
+                 f"{np.mean([x['spread_frac'] for x in base]) * 100:.1f}% of risk, about {len(base) / max(days / 30.4, 1):.1f} trades a month")
+    log.info("Need: avgR above 0 in BOTH halves, PF above 1.2, a few hundred trades.")
+    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+
+
+# ----------------------------------------------------------------------------
 # LIVE
 # ----------------------------------------------------------------------------
 _NEWS = {"t": 0.0, "events": None}
@@ -1990,6 +2457,10 @@ def main():
             run_backtest_lbo(api, days)
         elif strategy == "po3x":
             run_backtest_po3x(api, days)
+        elif strategy == "smc":
+            run_backtest_smc(api, days)
+        elif strategy == "combo":
+            run_backtest_combo(api, days)
         else:
             run_backtest(api, days)
         while True:  # idle so Railway does not keep re-running it
