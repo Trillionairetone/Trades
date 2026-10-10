@@ -12,6 +12,8 @@ Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
          BACKTEST_STRATEGY=po3c backtests Power Of Three + LuxAlgo Reversal Signals + Flux Consolidation Zones
          BACKTEST_STRATEGY=po3e backtests Power Of Three + LuxAlgo Echo Forecast
          BACKTEST_STRATEGY=lbo  backtests the London breakout (trade WITH the Asian-range break) vs the fade
+         BACKTEST_STRATEGY=po3x tunes Power Of Three + Echo exits (stop beyond the fake move, target the range)
+         BACKTEST_END_DAYS=N   ends the test window N days ago (to test an untouched past period)
 Safety : live entries are skipped near high-impact news (free Forex Factory feed), in the late New York
          hours, or when one currency is already over-exposed; trades are sized by % risk (RISK_PCT)
 Live   : EXIT_MODE=fixed (stop + 1:3 target, default) or EXIT_MODE=flip (stop only, the bot closes the
@@ -1593,6 +1595,124 @@ def run_backtest_lbo(api, days):
 
 
 # ----------------------------------------------------------------------------
+# BACKTEST: Power Of Three + Echo with structural exits (rules fixed before testing)
+#   Base    = unchanged: stop 5 x ATR(50), target 0.86R
+#   +Stop   = stop just beyond the fake move's extreme (0.25 ATR past it, at least 0.5 ATR from entry);
+#             target price kept the same as Base, so only the stop changes
+#   +Target = Base stop, target = the far side of the quiet range (where ICT says price is heading)
+#   Both    = structural stop + range target
+#   Window  = BACKTEST_DAYS long, ending BACKTEST_END_DAYS ago (0 = today). Tune on recent data,
+#             then run the final version ONCE on an older window nobody has looked at.
+# ----------------------------------------------------------------------------
+BACKTEST_END_DAYS = _i("BACKTEST_END_DAYS", 0)
+PO3X_STOP_PAD_ATR = 0.25
+PO3X_MIN_RISK_ATR = 0.5
+
+
+def simulate_po3x(d, pair, start_ts, end_ts, struct_stop, range_target):
+    acc_len, acc_mult, manip_mult = PO3_PRESETS.get(PO3_MODE, PO3_PRESETS["small"])
+    t = d["time"].tolist()
+    h, l, c = d["h"].to_numpy(), d["l"].to_numpy(), d["c"].to_numpy()
+    bo, bh, bl, bc = (d[k].to_numpy() for k in ("bo", "bh", "bl", "bc"))
+    ao, ah, al, ac = (d[k].to_numpy() for k in ("ao", "ah", "al", "ac"))
+    atr = calc_atr(d, 50).to_numpy()
+    hh = d["h"].rolling(acc_len).max().to_numpy()
+    ll = d["l"].rolling(acc_len).min().to_numpy()
+    n = len(d)
+    trades = []
+    state, i = 0, 0
+    acc_top = acc_bot = rng_hi = rng_lo = None
+    acc_end = 0
+    while i < n - 1:
+        a = atr[i]
+        if np.isnan(hh[i]) or np.isnan(a):
+            i += 1
+            continue
+        if state == 0 and hh[i] - ll[i] <= acc_mult * a:
+            state, acc_end = 1, i
+            rng_hi, rng_lo = hh[i], ll[i]
+            acc_top, acc_bot = hh[i] + 0.5 * a, ll[i] - 0.5 * a
+        if state == 1:
+            if h[i] > acc_top or l[i] < acc_bot:
+                state = 2
+            else:
+                acc_end = i
+        direction = 0
+        if state == 2 and i > acc_end:
+            if h[i] > acc_top + manip_mult * a:
+                direction = -1
+            elif l[i] < acc_bot - manip_mult * a:
+                direction = 1
+        if direction == 0:
+            i += 1
+            continue
+        state = 0
+        if echo_direction(c, i) != direction:
+            i += 1
+            continue
+        j = i + 1
+        entry = ao[j] if direction == 1 else bo[j]
+        base_risk = PO3_SL_ATR * a
+        base_tp = entry + direction * PO3_RR * base_risk
+        if struct_stop:
+            extreme = l[i] if direction == 1 else h[i]          # the fake move's furthest point
+            sl = extreme - direction * PO3X_STOP_PAD_ATR * a
+            risk = direction * (entry - sl)
+            if risk < PO3X_MIN_RISK_ATR * a:
+                risk = PO3X_MIN_RISK_ATR * a
+                sl = entry - direction * risk
+        else:
+            risk = base_risk
+            sl = entry - direction * risk
+        tp = (rng_hi if direction == 1 else rng_lo) if range_target else base_tp
+        reward = direction * (tp - entry)
+        if risk <= 0 or reward <= 0:
+            i += 1
+            continue
+        rr = reward / risk
+        r, k = _fixed_exit(direction, j, entry, sl, tp, rr, risk, bh, bl, bc, ah, al, ac, n)
+        if start_ts <= t[j] < end_ts:
+            trades.append({"pair": pair, "entry": t[j], "exit": t[k], "dir": direction, "r": float(r),
+                           "rr": rr, "risk_pips": risk / pip(pair), "spread_frac": (ao[j] - bo[j]) / risk})
+        i = k + 1
+    return trades
+
+
+def run_backtest_po3x(api, days):
+    now = datetime.now(timezone.utc)
+    end = now - timedelta(days=BACKTEST_END_DAYS)
+    start = end - timedelta(days=days)
+    start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+    log.info(f"BACKTEST | PO3 + Echo exit tuning | {TIMEFRAME} | {start:%Y-%m-%d} to {end:%Y-%m-%d} | pairs {PO3S_PAIRS}")
+    variants = {"Base": (False, False), "+Stop": (True, False), "+Target": (False, True), "Both": (True, True)}
+    rows = {k: [] for k in variants}
+    for pair in PO3S_PAIRS:
+        try:
+            sig = fetch_range(api, pair, TIMEFRAME, start - timedelta(days=max(10, SIG_WARMUP[TIMEFRAME])))
+            if len(sig) < 300:
+                log.info(f"{pair} | not enough history, skipped")
+                continue
+            for name, (ss, rt) in variants.items():
+                rows[name] += simulate_po3x(sig, pair, start_ts, end_ts, ss, rt)
+            first = sig["time"].iloc[0]
+            log.info(f"{pair} | done | data from {first:%Y-%m-%d} | Both: {sum(1 for x in rows['Both'] if x['pair'] == pair)} trades")
+        except Exception as e:
+            log.error(f"{pair} | BACKTEST ERROR | {e}")
+
+    log.info("")
+    log.info(f"===== PO3 + ECHO EXITS | {TIMEFRAME} | {start:%Y} to {end:%Y} | results in R =====")
+    log.info(f"{'':<8}{'n':>5}{'win':>6}{'avgR':>6}{'PF':>5}{'1st':>6}{'2nd':>6}")
+    for name, tr in rows.items():
+        log.info(_summary_line(name, tr))
+    for name, tr in rows.items():
+        if tr:
+            log.info(f"{name}: average target {np.mean([x['rr'] for x in tr]):.2f}R, stop "
+                     f"{np.mean([x['risk_pips'] for x in tr]):.0f} pips, spread {np.mean([x['spread_frac'] for x in tr]) * 100:.1f}% of risk")
+    log.info("Compare PF (avgR is per each version's own stop size). Need avgR above 0 in BOTH halves and PF above 1.2.")
+    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+
+
+# ----------------------------------------------------------------------------
 # LIVE
 # ----------------------------------------------------------------------------
 _NEWS = {"t": 0.0, "events": None}
@@ -1868,6 +1988,8 @@ def main():
             run_backtest_po3e(api, days)
         elif strategy == "lbo":
             run_backtest_lbo(api, days)
+        elif strategy == "po3x":
+            run_backtest_po3x(api, days)
         else:
             run_backtest(api, days)
         while True:  # idle so Railway does not keep re-running it
