@@ -19,6 +19,7 @@ Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
         BACKTEST_STRATEGY=po3v2 tests Power Of Three + trend filter + confirmation (break of structure, market entry)
         BACKTEST_STRATEGY=po3w wide test of PO3 + Echo (12 pairs, full history, + confirmation variants)
         BACKTEST_STRATEGY=tsm  daily trend-following (time-series momentum, 3/6/12-month lookbacks, 12 pairs)
+        BACKTEST_STRATEGY=scan M15 signal scanner (10 timing/level signals, search 2014-2020, holdout 2020-today)
         BACKTEST_STRATEGY=combo backtests your strategy + Power Of Three together (fake move against the
                                 H4/H1 trend, then your break of structure back with it)
          BACKTEST_END_DAYS=N   ends the test window N days ago (to test an untouched past period)
@@ -2578,6 +2579,210 @@ def run_backtest_tsm(api, days):
 
 
 # ----------------------------------------------------------------------------
+# M15 SIGNAL SCANNER (rules fixed before testing)
+#   Tests a batch of simple M15 timing/level signals at once, with a strict split:
+#     SEARCH  = SCAN_START to SCAN_SPLIT (default 2014-01-01 to 2020-01-01)
+#     HOLDOUT = SCAN_SPLIT to today (never looked at during the search)
+#   Holdout results are ONLY printed for signals that pass the search, so nothing can be cherry-picked.
+#   Cost control: EUR_USD + USD_JPY only, entries only in the London-New York overlap (08:00-12:00 New York),
+#   stop = 0.5 x daily ATR(20) (wide, so spread is a small share), target 1:1 or 1:2,
+#   every trade closed by 16:45 New York (no overnight swap). One trade per signal per day per pair.
+#   Signals (each tested as "f" = follow and "x" = fade/opposite, at 1:1 and 1:2):
+#     LDN   London session direction 03:00->08:00 NY, enter 08:00
+#     NY1H  first New York hour 08:00->09:00, enter 09:00
+#     PDHL  first M15 close beyond the previous day's high/low (08:00-12:00), enter next open
+#     ASIA  first M15 close beyond today's Asian range (19:00-03:00 NY), enter next open
+#     RND   first M15 close across a round number (EUR_USD 100 pips, USD_JPY 1 yen), enter next open
+#     FIX   move into the London 4pm fix (15:00->16:00 London), enter at 16:00 London
+#     H08..H11  fixed-hour drift: "f" = buy at that hour, "x" = sell
+#   SEARCH pass: 300+ trades, PF >= 1.3, avgR > 0 in both search halves, both pairs avgR > 0.
+#   HOLDOUT pass: avgR > 0 in both holdout halves, PF >= 1.2, both pairs avgR > 0.
+# ----------------------------------------------------------------------------
+SCAN_PAIRS = [p.strip().upper() for p in os.getenv("SCAN_PAIRS", "EUR_USD,USD_JPY").split(",") if p.strip()]
+SCAN_START = os.getenv("SCAN_START", "2014-01-01")
+SCAN_SPLIT = os.getenv("SCAN_SPLIT", "2020-01-01")
+SCAN_STOP_DATR = _f("SCAN_STOP_DATR", 0.5)
+
+
+def scan_entries(d, pair):
+    """For each signal name: list of (entry bar index, follow direction, session date)."""
+    ny = d["time"].dt.tz_convert("America/New_York")
+    ld = d["time"].dt.tz_convert("Europe/London")
+    mod = (ny.dt.hour * 60 + ny.dt.minute).to_numpy()
+    lmod = (ld.dt.hour * 60 + ld.dt.minute).to_numpy()
+    sd = (ny + pd.Timedelta(hours=7)).dt.date.to_numpy()
+    o, h, l, c = (d[k].to_numpy() for k in ("o", "h", "l", "c"))
+    step = 1.0 if "JPY" in pair else 0.01
+    out = {k: [] for k in ("LDN", "NY1H", "PDHL", "ASIA", "RND", "FIX", "H08", "H09", "H10", "H11")}
+    days = pd.Series(np.arange(len(d))).groupby(sd).agg(["min", "max"])
+    prev_hi = prev_lo = None
+    for day, (a, b) in zip(days.index, days.to_numpy()):
+        idx = np.arange(a, b + 1)
+        m = mod[idx]
+        at = {int(mm): int(ii) for mm, ii in zip(m, idx)}
+        lat = {int(mm): int(ii) for mm, ii in zip(lmod[idx], idx)}
+        win = [ii for ii in idx if 480 <= mod[ii] < 720]          # 08:00-11:45 NY bars
+        def add(name, e, dirn):
+            if dirn != 0 and e is not None and 480 <= mod[e] <= 720 and e <= b:
+                out[name].append((e, dirn, day))
+        if 180 in at and 480 in at:
+            add("LDN", at[480], int(np.sign(o[at[480]] - o[at[180]])))
+        if 480 in at and 540 in at:
+            add("NY1H", at[540], int(np.sign(o[at[540]] - o[at[480]])))
+        for hh, name in ((480, "H08"), (540, "H09"), (600, "H10"), (660, "H11")):
+            if hh in at:
+                add(name, at[hh], 1)
+        if 900 in lat and 960 in lat and 480 <= mod[lat[960]] <= 720:
+            add("FIX", lat[960], int(np.sign(o[lat[960]] - o[lat[900]])))
+        asia = [ii for ii in idx if mod[ii] >= 1140 or mod[ii] < 180]
+        a_hi = h[asia].max() if len(asia) >= 20 else None
+        a_lo = l[asia].min() if len(asia) >= 20 else None
+        done = {"PDHL": False, "ASIA": False, "RND": False}
+        for ii in win:
+            if ii + 1 > b:
+                break
+            if not done["PDHL"] and prev_hi is not None:
+                if c[ii] > prev_hi:
+                    add("PDHL", ii + 1, 1); done["PDHL"] = True
+                elif c[ii] < prev_lo:
+                    add("PDHL", ii + 1, -1); done["PDHL"] = True
+            if not done["ASIA"] and a_hi is not None:
+                if c[ii] > a_hi:
+                    add("ASIA", ii + 1, 1); done["ASIA"] = True
+                elif c[ii] < a_lo:
+                    add("ASIA", ii + 1, -1); done["ASIA"] = True
+            if not done["RND"] and ii - 1 >= a:
+                if np.floor(c[ii - 1] / step) != np.floor(c[ii] / step):
+                    add("RND", ii + 1, int(np.sign(c[ii] - c[ii - 1]))); done["RND"] = True
+        prev_hi, prev_lo = h[idx].max(), l[idx].min()
+    return out, mod
+
+
+def scan_simulate(d, pair, entries, mod, datr, rr, flip):
+    t = d["time"].tolist()
+    bo, bh, bl, bc = (d[k].to_numpy() for k in ("bo", "bh", "bl", "bc"))
+    ao, ah, al, ac = (d[k].to_numpy() for k in ("ao", "ah", "al", "ac"))
+    n = len(d)
+    trades = []
+    for e, dirn, day in entries:
+        dirn = -dirn if flip else dirn
+        a = datr.get(day)
+        if a is None or np.isnan(a):
+            continue
+        risk = SCAN_STOP_DATR * a
+        entry = ao[e] if dirn == 1 else bo[e]
+        spread = ao[e] - bo[e]
+        if spread > MAX_SPREAD_RISK * risk:
+            continue
+        sl, tp = entry - dirn * risk, entry + dirn * rr * risk
+        r, k = None, e
+        while k < n:
+            if k > e and (mod[k] > 1005 or mod[k] < mod[e]):   # past the 16:45 NY candle or into the next day
+                k -= 1
+                break
+            if dirn == 1:
+                if bl[k] <= sl:
+                    r = -1.0; break
+                if bh[k] >= tp:
+                    r = rr; break
+            else:
+                if ah[k] >= sl:
+                    r = -1.0; break
+                if al[k] <= tp:
+                    r = rr; break
+            if mod[k] == 1005:                                    # the 16:45 candle: close at its close
+                break
+            k += 1
+        k = min(max(k, e), n - 1)
+        if r is None:
+            r = dirn * ((bc[k] if dirn == 1 else ac[k]) - entry) / risk
+        trades.append({"pair": pair, "entry": t[e], "exit": t[k], "dir": dirn, "r": float(r),
+                       "risk_pips": risk / pip(pair), "spread_frac": spread / risk})
+    return trades
+
+
+def _scan_line(label, tr):
+    s = stats(tr)
+    o = sorted(tr, key=lambda x: x["entry"])
+    h2 = len(o) // 2
+    a1, a2 = stats(o[:h2])["avg"], stats(o[h2:])["avg"]
+    return f"{label:<10}{s['n']:>5}{s['win']:>5.0f}%{s['avg']:>6.2f}{s['pf']:>5.2f}{a1:>6.2f}{a2:>6.2f}"
+
+
+def _scan_checks(tr, pf_min, n_min):
+    s = stats(tr)
+    o = sorted(tr, key=lambda x: x["entry"])
+    h2 = len(o) // 2
+    if s["n"] < n_min or s["pf"] < pf_min or h2 == 0:
+        return False
+    if stats(o[:h2])["avg"] <= 0 or stats(o[h2:])["avg"] <= 0:
+        return False
+    for p in SCAN_PAIRS:
+        rp = [x["r"] for x in tr if x["pair"] == p]
+        if not rp or np.mean(rp) <= 0:
+            return False
+    return True
+
+
+def run_scan(api, days):
+    t0 = pd.Timestamp(SCAN_START, tz="UTC")
+    split = pd.Timestamp(SCAN_SPLIT, tz="UTC")
+    log.info(f"SCAN | M15 signal scanner | search {t0:%Y-%m-%d} to {split:%Y-%m-%d} | holdout {split:%Y-%m-%d} "
+             f"to today | pairs {SCAN_PAIRS}")
+    res = {}
+    for pair in SCAN_PAIRS:
+        try:
+            d = fetch_range(api, pair, "M15", (t0 - pd.Timedelta(days=40)).to_pydatetime())
+            if len(d) < 5000:
+                log.info(f"{pair} | not enough history, skipped")
+                continue
+            entries, mod = scan_entries(d, pair)
+            ny = d["time"].dt.tz_convert("America/New_York")
+            sd = (ny + pd.Timedelta(hours=7)).dt.date
+            dly = d.groupby(sd.to_numpy()).agg(h=("h", "max"), l=("l", "min"), c=("c", "last"))
+            pc = dly["c"].shift(1)
+            trr = np.maximum(dly["h"] - dly["l"], np.maximum((dly["h"] - pc).abs(), (dly["l"] - pc).abs()))
+            datr = trr.rolling(20).mean().shift(1).to_dict()          # known before the day starts
+            for name, ent in entries.items():
+                for rr in (1.0, 2.0):
+                    for flip, tag in ((False, "f"), (True, "x")):
+                        key = f"{name} {tag}{rr:g}"
+                        res.setdefault(key, []).extend(
+                            [x for x in scan_simulate(d, pair, ent, mod, datr, rr, flip) if x["entry"] >= t0])
+            log.info(f"{pair} | done | {len(d)} candles from {d['time'].iloc[0]:%Y-%m-%d}")
+        except Exception as e:
+            log.error(f"{pair} | SCAN ERROR | {e}")
+
+    search = {k: [x for x in v if x["entry"] < split] for k, v in res.items()}
+    hold = {k: [x for x in v if x["entry"] >= split] for k, v in res.items()}
+    log.info("")
+    log.info(f"===== M15 SCAN | SEARCH {t0:%Y}-{split:%Y} | {len(search)} signals tested =====")
+    log.info("f = follow, x = fade, number = target in R. Coin flip: 1:1 = 50%, 1:2 = 33%.")
+    log.info(f"{'':<10}{'n':>5}{'win':>6}{'avgR':>6}{'PF':>5}{'1st':>6}{'2nd':>6}")
+    ranked = sorted(search.items(), key=lambda kv: -stats(kv[1])["avg"] if kv[1] else 0)
+    for k, v in ranked[:8]:
+        log.info(_scan_line(k, v))
+    passed = [k for k, v in search.items() if _scan_checks(v, 1.3, 300)]
+    log.info(f"(top 8 of {len(search)} by avgR shown) | SEARCH passes: {len(passed)} -> {passed if passed else 'none'}")
+    if passed:
+        log.info("")
+        log.info(f"===== HOLDOUT {split:%Y}-today (passers only, first time seen) =====")
+        log.info(f"{'':<10}{'n':>5}{'win':>6}{'avgR':>6}{'PF':>5}{'1st':>6}{'2nd':>6}")
+        for k in passed:
+            ok = _scan_checks(hold[k], 1.2, 1)
+            log.info(_scan_line(k, hold[k]) + ("  PASS" if ok else "  fail"))
+            per = ", ".join(f"{p} {np.mean([x['r'] for x in hold[k] if x['pair'] == p]):+.2f}"
+                            for p in SCAN_PAIRS if any(x["pair"] == p for x in hold[k]))
+            log.info(f"   {k} holdout by pair: {per}")
+    allr = [x for v in search.values() for x in v]
+    if allr:
+        log.info(f"Avg stop {np.mean([x['risk_pips'] for x in allr]):.1f} pips, spread "
+                 f"{np.mean([x['spread_frac'] for x in allr]) * 100:.1f}% of risk.")
+    log.info("A signal counts only if it passes SEARCH and then HOLDOUT. Then it goes to the demo account first.")
+    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+
+
+# ----------------------------------------------------------------------------
 # LIVE
 # ----------------------------------------------------------------------------
 _NEWS = {"t": 0.0, "events": None}
@@ -2867,6 +3072,8 @@ def main():
             run_backtest_po3w(api, days)
         elif strategy == "tsm":
             run_backtest_tsm(api, days)
+        elif strategy == "scan":
+            run_scan(api, days)
         else:
             run_backtest(api, days)
         while True:  # idle so Railway does not keep re-running it
