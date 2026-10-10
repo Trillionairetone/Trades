@@ -18,6 +18,7 @@ Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
          BACKTEST_STRATEGY=smce tests 3 entries for your strategy: limit pullback vs market at the break vs confirmation candle
         BACKTEST_STRATEGY=po3v2 tests Power Of Three + trend filter + confirmation (break of structure, market entry)
         BACKTEST_STRATEGY=po3w wide test of PO3 + Echo (12 pairs, full history, + confirmation variants)
+        BACKTEST_STRATEGY=tsm  daily trend-following (time-series momentum, 3/6/12-month lookbacks, 12 pairs)
         BACKTEST_STRATEGY=combo backtests your strategy + Power Of Three together (fake move against the
                                 H4/H1 trend, then your break of structure back with it)
          BACKTEST_END_DAYS=N   ends the test window N days ago (to test an untouched past period)
@@ -2482,6 +2483,101 @@ def run_backtest_po3w(api, days):
 
 
 # ----------------------------------------------------------------------------
+# BACKTEST: daily trend-following / time-series momentum (rules fixed before testing)
+#   Daily candles. Every TSM_CHECK trading days (default 5 = weekly) look at the close vs the close
+#   L days ago: higher -> be long, lower -> be short. If that differs from the current position,
+#   close it and reverse at the next day's open (real bid/ask, so spread is paid). Always in the market.
+#   No stop and no target: trades end only when the trend signal flips.
+#   1R = 3 x daily ATR(20) at entry (a size unit so results compare with the other tests).
+#   Lookbacks: 60 / 120 / 250 days (about 3, 6, 12 months). Overnight financing (swap) is NOT included.
+#   Pass: avgR > 0 in BOTH halves, PF >= 1.2, 300+ trades, most pairs positive, neighbouring lookbacks agree.
+# ----------------------------------------------------------------------------
+TSM_LOOKBACKS = [int(x) for x in os.getenv("TSM_LOOKBACKS", "60,120,250").split(",") if x.strip()]
+TSM_CHECK = _i("TSM_CHECK", 5)
+
+
+def simulate_tsm(d, pair, start_ts, end_ts, lookback):
+    t = d["time"].tolist()
+    c = d["c"].to_numpy()
+    bo, ao = d["bo"].to_numpy(), d["ao"].to_numpy()
+    bc, ac = d["bc"].to_numpy(), d["ac"].to_numpy()
+    atr = calc_atr(d, 20).to_numpy()
+    n = len(d)
+    trades = []
+    pos = None
+
+    def close(p, k, price):
+        r = p["dir"] * (price - p["entry"]) / p["risk"]
+        if start_ts <= p["t"] < end_ts:
+            trades.append({"pair": pair, "entry": p["t"], "exit": t[k], "dir": p["dir"], "r": float(r),
+                           "risk_pips": p["risk"] / pip(pair), "spread_frac": p["spread"] / p["risk"],
+                           "days": k - p["fill"]})
+
+    for i in range(lookback, n - 1, TSM_CHECK):
+        if np.isnan(atr[i]):
+            continue
+        sig = 1 if c[i] > c[i - lookback] else (-1 if c[i] < c[i - lookback] else 0)
+        if sig == 0 or (pos is not None and pos["dir"] == sig):
+            continue
+        j = i + 1
+        if pos is not None:
+            close(pos, j, bo[j] if pos["dir"] == 1 else ao[j])
+        entry = ao[j] if sig == 1 else bo[j]
+        pos = {"dir": sig, "entry": entry, "risk": 3 * atr[i], "fill": j, "t": t[j], "spread": ao[j] - bo[j]}
+    if pos is not None:
+        close(pos, n - 1, bc[n - 1] if pos["dir"] == 1 else ac[n - 1])
+    return trades
+
+
+def run_backtest_tsm(api, days):
+    now = datetime.now(timezone.utc)
+    end = now - timedelta(days=BACKTEST_END_DAYS)
+    start = end - timedelta(days=days)
+    start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+    log.info(f"BACKTEST | daily trend-following (time-series momentum) | D | {start:%Y-%m-%d} to {end:%Y-%m-%d} | "
+             f"{len(PO3W_PAIRS)} pairs {PO3W_PAIRS}")
+    rows = {f"TS{L}": [] for L in TSM_LOOKBACKS}
+    for pair in PO3W_PAIRS:
+        try:
+            dly = fetch_range(api, pair, "D", start - timedelta(days=int(max(TSM_LOOKBACKS) * 1.6) + 60))
+            if len(dly) < max(TSM_LOOKBACKS) + 100:
+                log.info(f"{pair} | not enough history, skipped")
+                continue
+            for L in TSM_LOOKBACKS:
+                rows[f"TS{L}"] += simulate_tsm(dly, pair, start_ts, end_ts, L)
+            log.info(f"{pair} | done | first candle {dly['time'].iloc[0]:%Y-%m-%d}")
+        except Exception as e:
+            log.error(f"{pair} | BACKTEST ERROR | {e}")
+
+    log.info("")
+    log.info(f"===== TREND-FOLLOWING | D | {start:%Y} to {end:%Y} | results in R (1R = 3 x ATR) =====")
+    log.info(f"{'':<8}{'n':>5}{'win':>6}{'avgR':>6}{'PF':>5}{'1st':>6}{'2nd':>6}")
+    for name, tr in rows.items():
+        log.info(_summary_line(name, tr))
+    years = max(days / 365.25, 1)
+    for name, tr in rows.items():
+        if not tr:
+            continue
+        st = stats(tr)
+        per = {}
+        for x in tr:
+            per.setdefault(x["pair"], []).append(x["r"])
+        pos = sum(1 for v in per.values() if np.sum(v) > 0)
+        log.info(f"{name}: {pos} of {len(per)} pairs positive | total {st['total']:+.0f}R ({st['total'] / years:+.1f}R/yr) | "
+                 f"worst drawdown {st['dd']:.0f}R | avg hold {np.mean([x['days'] for x in tr]):.0f} days | "
+                 f"spread {np.mean([x['spread_frac'] for x in tr]) * 100:.1f}% of risk")
+    mid = rows.get("TS120") or next(iter(rows.values()))
+    per = {}
+    for x in mid:
+        per.setdefault(x["pair"], []).append(x["r"])
+    log.info("TS120 by pair (total R): " + ", ".join(f"{k} {np.sum(v):+.0f}" for k, v in per.items()))
+    log.info("Win rate is low by design: trend-following loses small and often, wins big and rarely.")
+    log.info("Swap/financing not included. Pass: avgR > 0 in BOTH halves, PF >= 1.2, 300+ trades, most pairs "
+             "positive, lookbacks agree.")
+    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+
+
+# ----------------------------------------------------------------------------
 # LIVE
 # ----------------------------------------------------------------------------
 _NEWS = {"t": 0.0, "events": None}
@@ -2769,6 +2865,8 @@ def main():
             run_backtest_po3v2(api, days)
         elif strategy == "po3w":
             run_backtest_po3w(api, days)
+        elif strategy == "tsm":
+            run_backtest_tsm(api, days)
         else:
             run_backtest(api, days)
         while True:  # idle so Railway does not keep re-running it
