@@ -21,6 +21,7 @@ Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
         BACKTEST_STRATEGY=tsm  daily trend-following (time-series momentum, 3/6/12-month lookbacks, 12 pairs)
         BACKTEST_STRATEGY=scan M15 signal scanner (10 timing/level signals, search 2014-2020, holdout 2020-today)
         BACKTEST_STRATEGY=sax  volume-drift SuperTrend (Swift Algo X style) + 144-combo walk-forward optimizer
+        BACKTEST_STRATEGY=xgb  GainzAlgo XG Boost Lite reversals (rolling ML model) vs the same pivots without the model
         BACKTEST_STRATEGY=combo backtests your strategy + Power Of Three together (fake move against the
                                 H4/H1 trend, then your break of structure back with it)
          BACKTEST_END_DAYS=N   ends the test window N days ago (to test an untouched past period)
@@ -3017,6 +3018,195 @@ def run_backtest_sax(api, days):
 
 
 # ----------------------------------------------------------------------------
+# BACKTEST: GainzAlgo "XG Boost Lite: Reversals" (rules fixed before testing)
+#   Rebuilt from the posted Pine Script (the Arbor library itself isn't public, so the boosting is a standard
+#   gradient-boosted decision-stump model with the same settings: 20 rounds, learning rate 0.3).
+#   Features: RSI(14), relative tick volume (vol / SMA20), z-score of close vs SMA20, ADX(14).
+#   Labels: did price move more than 1 ATR in the trade's favour within the next 15 candles (long and short models),
+#   plus regression models for the size of that move (used for TP3).
+#   Training: last 250 candles, labels only where the 15-candle outcome is already known (no lookahead),
+#   retrained every 50 candles - so every signal is genuinely out-of-sample.
+#   Signal: pivot candle (new 8-candle low/high that closes back past the midpoint), model probability >= 0.65,
+#   ADX >= 20. Entry at the next candle's open (bar-close confirmation). Stop = pivot wick +/- 0.25 ATR (min 0.5 ATR).
+#   Rows:  ML 1:1  = exit everything at TP1 (1R)
+#          ML TP3  = stop to break-even at TP1, exit at TP3 = max(predicted move, 2R)
+#          Raw 1:1 / Raw TP3 = same pivots + ADX filter WITHOUT the model (shows whether the model adds anything)
+#   Pass: an ML row with avgR > 0 in BOTH halves, PF >= 1.2, a few hundred trades, AND clearly better than Raw.
+# ----------------------------------------------------------------------------
+def _rsi(c, n=14):
+    d = c.diff()
+    up = d.clip(lower=0).ewm(alpha=1.0 / n, adjust=False).mean()
+    dn = (-d.clip(upper=0)).ewm(alpha=1.0 / n, adjust=False).mean()
+    return 100 - 100 / (1 + up / dn.replace(0, np.nan))
+
+
+def gbm_fit(X, y, rounds=20, lr=0.3, cls=True, lam=1.0):
+    qs = np.quantile(X, np.linspace(0.07, 0.93, 13), axis=0)            # candidate thresholds per feature
+    if cls:
+        p0 = min(max(y.mean(), 0.02), 0.98)
+        f0 = float(np.log(p0 / (1 - p0)))
+    else:
+        f0 = float(y.mean())
+    F = np.full(len(y), f0)
+    trees = []
+    for _ in range(rounds):
+        if cls:
+            pr = 1 / (1 + np.exp(-F))
+            g, hs = y - pr, pr * (1 - pr)
+        else:
+            g, hs = y - F, np.ones(len(y))
+        G, H = g.sum(), hs.sum()
+        best = None
+        for f in range(X.shape[1]):
+            masks = X[:, f][:, None] <= qs[:, f][None, :]
+            GL, HL = g @ masks, hs @ masks
+            GR, HR = G - GL, H - HL
+            gain = GL ** 2 / (HL + lam) + GR ** 2 / (HR + lam)
+            k = int(np.argmax(gain))
+            if best is None or gain[k] > best[0]:
+                best = (gain[k], f, qs[k, f], lr * GL[k] / (HL[k] + lam), lr * GR[k] / (HR[k] + lam))
+        _, f, thr, vl, vr = best
+        F += np.where(X[:, f] <= thr, vl, vr)
+        trees.append((f, thr, vl, vr))
+    return (f0, trees, cls)
+
+
+def gbm_predict(model, x):
+    f0, trees, cls = model
+    v = f0 + sum(vl if x[f] <= thr else vr for f, thr, vl, vr in trees)
+    return 1 / (1 + np.exp(-v)) if cls else v
+
+
+def simulate_xgb(d, pair, start_ts, end_ts, use_model, mode):
+    t = d["time"].tolist()
+    h, l, c = d["h"].to_numpy(), d["l"].to_numpy(), d["c"].to_numpy()
+    bo, bh, bl, bc = (d[k].to_numpy() for k in ("bo", "bh", "bl", "bc"))
+    ao, ah, al, ac = (d[k].to_numpy() for k in ("ao", "ah", "al", "ac"))
+    atr = np.maximum(calc_atr(d, 14).to_numpy(), 1e-9)
+    adx = calc_adx(d, 14).to_numpy()
+    vol = d["volume"].astype(float)
+    X = np.column_stack([_rsi(d["c"]).to_numpy(), (vol / vol.rolling(20).mean()).fillna(1.0).to_numpy(),
+                         ((d["c"] - d["c"].rolling(20).mean()) / d["c"].rolling(20).std(ddof=0).clip(lower=1e-9)).to_numpy(),
+                         adx])
+    n, fw, lb = len(d), 15, 250
+    # outcome labels for an entry at bar k (needs bars k+1..k+15)
+    fmax = pd.Series(h[::-1]).rolling(fw).max().to_numpy()[::-1]       # max of h[k..k+14]
+    fmin = pd.Series(l[::-1]).rolling(fw).min().to_numpy()[::-1]
+    upmv = np.full(n, np.nan); dnmv = np.full(n, np.nan)
+    upmv[:-1] = (fmax[1:] - c[:-1]) / atr[:-1]
+    dnmv[:-1] = (c[:-1] - fmin[1:]) / atr[:-1]
+    lo8 = pd.Series(l).rolling(8).min().shift(1).to_numpy()
+    hi8 = pd.Series(h).rolling(8).max().shift(1).to_numpy()
+    mid = l + (h - l) * 0.5
+    bull = (l < lo8) & (c > mid)
+    bear = (h > hi8) & (c < mid)
+    valid = ~np.isnan(X).any(axis=1)
+    models = None
+    trades = []
+    i = lb + 1
+    busy_until = -1
+    while i < n - 2:
+        if use_model and i % 50 == 0 and valid[i]:
+            rows = np.arange(i - lb, i - fw)                               # outcomes fully known by bar i
+            rows = rows[valid[rows] & ~np.isnan(upmv[rows]) & ~np.isnan(dnmv[rows])]
+            if len(rows) >= 20:
+                Xt = X[rows]
+                models = (gbm_fit(Xt, (upmv[rows] > 1.0).astype(float)), gbm_fit(Xt, np.maximum(upmv[rows], 0), cls=False),
+                          gbm_fit(Xt, (dnmv[rows] > 1.0).astype(float)), gbm_fit(Xt, np.maximum(dnmv[rows], 0), cls=False))
+        if i <= busy_until or not valid[i] or adx[i] < 20 or not (bull[i] or bear[i]):
+            i += 1
+            continue
+        dirn = 1 if bull[i] else -1
+        reg = 0.0
+        if use_model:
+            if models is None:
+                i += 1
+                continue
+            pm, rm = (models[0], models[1]) if dirn == 1 else (models[2], models[3])
+            if gbm_predict(pm, X[i]) < 0.65:
+                i += 1
+                continue
+            reg = max(gbm_predict(rm, X[i]), 0.0)
+        j = i + 1
+        entry = ao[j] if dirn == 1 else bo[j]
+        raw_sl = (l[i] - 0.25 * atr[i]) if dirn == 1 else (h[i] + 0.25 * atr[i])
+        risk = dirn * (entry - raw_sl)
+        if risk < 0.5 * atr[i]:
+            risk = 0.5 * atr[i]
+        sl = entry - dirn * risk
+        tp1 = entry + dirn * risk
+        tp3 = entry + dirn * max(reg * atr[i], 2.0 * risk)
+        tp = tp1 if mode == "tp1" else tp3
+        be = False
+        r, k = None, j
+        while k < n and k - j < SB_MAX_BARS:
+            lo_, hi_ = (bl[k], bh[k]) if dirn == 1 else (al[k], ah[k])
+            stop_hit = lo_ <= sl if dirn == 1 else hi_ >= sl
+            if stop_hit:
+                r = 0.0 if be else -1.0
+                if be:
+                    r = dirn * (sl - entry) / risk
+                break
+            tgt_hit = hi_ >= tp if dirn == 1 else lo_ <= tp
+            if tgt_hit:
+                r = dirn * (tp - entry) / risk
+                break
+            if mode == "tp3" and not be and (hi_ >= tp1 if dirn == 1 else lo_ <= tp1):
+                be, sl = True, entry                                          # break-even after TP1 (next candle on)
+            k += 1
+        k = min(k, n - 1)
+        if r is None:
+            r = dirn * ((bc[k] if dirn == 1 else ac[k]) - entry) / risk
+        if start_ts <= t[j] < end_ts:
+            trades.append({"pair": pair, "entry": t[j], "exit": t[k], "dir": dirn, "r": float(r),
+                           "risk_pips": risk / pip(pair), "spread_frac": (ao[j] - bo[j]) / risk})
+        busy_until = k
+        i = k + 1
+    return trades
+
+
+def run_backtest_xgb(api, days):
+    now = datetime.now(timezone.utc)
+    end = now - timedelta(days=BACKTEST_END_DAYS)
+    start = end - timedelta(days=days)
+    start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+    log.info(f"BACKTEST | XG Boost Lite reversals (rolling machine learning) | {TIMEFRAME} | "
+             f"{start:%Y-%m-%d} to {end:%Y-%m-%d} | pairs {SMC_PAIRS}")
+    rows = {"ML 1:1": [], "ML TP3": [], "Raw 1:1": [], "Raw TP3": []}
+    for pair in SMC_PAIRS:
+        try:
+            d = fetch_range(api, pair, TIMEFRAME, start - timedelta(days=10))
+            d = d[d["time"] < end_ts].reset_index(drop=True)
+            if len(d) < 1000:
+                log.info(f"{pair} | not enough history, skipped")
+                continue
+            rows["ML 1:1"] += simulate_xgb(d, pair, start_ts, end_ts, True, "tp1")
+            rows["ML TP3"] += simulate_xgb(d, pair, start_ts, end_ts, True, "tp3")
+            rows["Raw 1:1"] += simulate_xgb(d, pair, start_ts, end_ts, False, "tp1")
+            rows["Raw TP3"] += simulate_xgb(d, pair, start_ts, end_ts, False, "tp3")
+            log.info(f"{pair} | done")
+            del d
+            gc.collect()
+        except Exception as e:
+            log.error(f"{pair} | BACKTEST ERROR | {e}")
+
+    log.info("")
+    log.info(f"===== XG BOOST LITE | {TIMEFRAME} | {start:%Y} to {end:%Y} | results in R =====")
+    log.info(f"{'':<8}{'n':>5}{'win':>6}{'avgR':>6}{'PF':>5}{'1st':>6}{'2nd':>6}")
+    for name, tr in rows.items():
+        log.info(_summary_line(name, tr))
+    log.info("Coin flip: 1:1 = 50%. TP3 rows: break-even trades count as non-wins, so judge them by avgR and PF.")
+    months = max(days / 30.4, 1)
+    for name in ("ML 1:1", "Raw 1:1"):
+        tr = rows[name]
+        if tr:
+            log.info(f"{name}: avg stop {np.mean([x['risk_pips'] for x in tr]):.1f} pips, spread "
+                     f"{np.mean([x['spread_frac'] for x in tr]) * 100:.1f}% of risk, {len(tr) / months:.1f} trades/month")
+    log.info("Pass: an ML row with avgR > 0 in BOTH halves, PF >= 1.2, a few hundred trades, AND better than Raw.")
+    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+
+
+# ----------------------------------------------------------------------------
 # LIVE
 # ----------------------------------------------------------------------------
 _NEWS = {"t": 0.0, "events": None}
@@ -3310,6 +3500,8 @@ def main():
             run_scan(api, days)
         elif strategy == "sax":
             run_backtest_sax(api, days)
+        elif strategy == "xgb":
+            run_backtest_xgb(api, days)
         else:
             run_backtest(api, days)
         while True:  # idle so Railway does not keep re-running it
