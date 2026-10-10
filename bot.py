@@ -11,6 +11,9 @@ Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
          BACKTEST_STRATEGY=po3s backtests the session Power Of Three (Asian range -> London fake move -> fade)
          BACKTEST_STRATEGY=po3c backtests Power Of Three + LuxAlgo Reversal Signals + Flux Consolidation Zones
          BACKTEST_STRATEGY=po3e backtests Power Of Three + LuxAlgo Echo Forecast
+         BACKTEST_STRATEGY=lbo  backtests the London breakout (trade WITH the Asian-range break) vs the fade
+Safety : live entries are skipped near high-impact news (free Forex Factory feed), in the late New York
+         hours, or when one currency is already over-exposed; trades are sized by % risk (RISK_PCT)
 Live   : EXIT_MODE=fixed (stop + 1:3 target, default) or EXIT_MODE=flip (stop only, the bot closes the
          trade itself when UT Bot signals the other way; only trades the bot opened are managed)
 Exits  : backtest compares "flip" (exit when UT Bot signals the other way) with "sr" (same, plus a take-profit
@@ -96,7 +99,15 @@ if EXIT_MODE not in ("fixed", "flip"):
 STOP_MODE = os.getenv("STOP_MODE", "atr").lower()    # "atr": stop = SL_ATR_MULT x ATR(14); "ut": stop = the UT trailing-stop distance (UT_KEY x ATR(UT_ATR))
 if STOP_MODE not in ("atr", "ut"):
     raise RuntimeError(f"STOP_MODE must be 'atr' or 'ut', got {STOP_MODE!r}")
-MANAGED_TAG = "utflip"                               # marks trades opened by this bot, so old/manual trades are never touched
+MANAGED_TAG = "utflip"
+RISK_PCT = _f("RISK_PCT", 0.5)               # % of balance risked per trade (0 = fixed UNITS instead)
+MAX_UNITS = _i("MAX_UNITS", 50000)           # hard cap on trade size
+MAX_PER_CURRENCY = _i("MAX_PER_CURRENCY", 2) # max net same-direction trades per currency
+NEWS_FILTER = os.getenv("NEWS_FILTER", "1") == "1"
+NEWS_BLOCK_MIN = _i("NEWS_BLOCK_MIN", 30)    # no new trades this many minutes either side of high-impact news
+NEWS_FAIL_MODE = os.getenv("NEWS_FAIL_MODE", "allow").lower()  # if the feed is down: "allow" trading or "block" it
+NEWS_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+NY_BLOCK = os.getenv("NY_BLOCK", "16:30-18:30")  # New York time window with no new trades ("" to turn off)                               # marks trades opened by this bot, so old/manual trades are never touched
 
 
 def pip(pair):
@@ -225,8 +236,17 @@ def fetch_range(api, pair, gran, start):
     return parse_candles(raw_all)
 
 
+_HOME_CONV = {}
+
+
 def get_prices(api):
-    data = api.get(f"/v3/accounts/{api.account}/pricing", {"instruments": ",".join(PAIRS)})
+    data = api.get(f"/v3/accounts/{api.account}/pricing",
+                   {"instruments": ",".join(PAIRS), "includeHomeConversions": "true"})
+    for hc in data.get("homeConversions", []):
+        try:
+            _HOME_CONV[hc["currency"]] = float(hc["accountLoss"])
+        except (KeyError, ValueError):
+            pass
     out = {}
     for p in data.get("prices", []):
         if not p.get("tradeable", True):
@@ -1101,7 +1121,7 @@ def _fixed_exit(direction, j, entry, sl, tp, rr, risk, bh, bl, bc, ah, al, ac, n
     return direction * (exit_p - entry) / risk, k
 
 
-def simulate_po3_session(d, dly, pair, start_ts, need_sweep):
+def simulate_po3_session(d, dly, pair, start_ts, need_sweep, follow=False):
     t = d["time"].tolist()
     h, l = d["h"].to_numpy(), d["l"].to_numpy()
     bo, bh, bl, bc = (d[k].to_numpy() for k in ("bo", "bh", "bl", "bc"))
@@ -1150,6 +1170,8 @@ def simulate_po3_session(d, dly, pair, start_ts, need_sweep):
             direction = 1
         if direction == 0:
             continue
+        if follow:              # London breakout: go WITH the break instead of fading it
+            direction = -direction
         done_today = True
         j = i + 1
         entry = ao[j] if direction == 1 else bo[j]
@@ -1531,10 +1553,151 @@ def run_backtest_po3e(api, days):
 
 
 # ----------------------------------------------------------------------------
+# BACKTEST: London breakout (rules fixed before testing)
+#   Exactly the session Power Of Three setup (Asian range, break at the London open, stop 5 x ATR,
+#   target 0.86R, 3 tight-spread pairs) but trading WITH the break. The idea came from the fade losing
+#   on the last 2 years, so only the OLDER half of a longer run counts as a fair test.
+# ----------------------------------------------------------------------------
+def run_backtest_lbo(api, days):
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+    start_ts = pd.Timestamp(start)
+    log.info(f"BACKTEST | London breakout vs fade | {TIMEFRAME} | last {days} days | pairs {PO3S_PAIRS}")
+    fade, brk, per_pair = [], [], []
+    for pair in PO3S_PAIRS:
+        try:
+            sig = fetch_range(api, pair, TIMEFRAME, start - timedelta(days=10))
+            dly = fetch_range(api, pair, "D", start - timedelta(days=20))
+            if len(sig) < 300:
+                log.info(f"{pair} | not enough history, skipped")
+                continue
+            f1 = simulate_po3_session(sig, dly, pair, start_ts, need_sweep=False, follow=False)
+            b1 = simulate_po3_session(sig, dly, pair, start_ts, need_sweep=False, follow=True)
+            fade += f1
+            brk += b1
+            per_pair.append((pair, stats(b1)))
+            log.info(f"{pair} | done | breakout {len(b1)} trades")
+        except Exception as e:
+            log.error(f"{pair} | BACKTEST ERROR | {e}")
+    log.info("")
+    log.info(f"===== LONDON BREAKOUT | {TIMEFRAME} | last {days} days | results in R =====")
+    log.info(f"{'':<8}{'n':>5}{'win':>6}{'avgR':>6}{'PF':>5}{'1st':>6}{'2nd':>6}")
+    log.info(_summary_line("Fade", fade))
+    log.info(_summary_line("Breakout", brk))
+    log.info("Judge Breakout on its 1st (older) half only: the newer half is where the idea came from.")
+    log.info(f"{'pair':<9}{'n':>5}{'totalR':>8}")
+    for pair, s in per_pair:
+        log.info(f"{pair:<9}{s['n']:>5}{s['total']:>8.1f}")
+    log.info(f"Targets {PO3_RR:g}R per 1R risked, so it needs {100 / (1 + PO3_RR):.0f}%+ wins to break even.")
+    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+
+
+# ----------------------------------------------------------------------------
 # LIVE
 # ----------------------------------------------------------------------------
-def place_order(api, pair, direction, sl, tp=None):
-    units = UNITS if direction == 1 else -UNITS
+_NEWS = {"t": 0.0, "events": None}
+
+
+def news_events():
+    """High-impact events this week from the free Forex Factory feed, refreshed every 3 hours."""
+    now = time.time()
+    if now - _NEWS["t"] < 3 * 3600:
+        return _NEWS["events"]
+    try:
+        r = requests.get(NEWS_URL, timeout=15, headers={"User-Agent": "Mozilla/5.0 (trading bot)"})
+        r.raise_for_status()
+        events = []
+        for e in r.json():
+            if str(e.get("impact", "")).lower() != "high":
+                continue
+            try:
+                ts = pd.Timestamp(e["date"]).tz_convert("UTC")
+            except Exception:
+                continue
+            events.append((str(e.get("country", "")).upper(), ts, str(e.get("title", ""))))
+        _NEWS.update(t=now, events=events)
+        log.info(f"news calendar loaded | {len(events)} high-impact events this week")
+    except Exception as ex:
+        _NEWS["t"] = now - 3 * 3600 + 900   # try again in 15 minutes
+        log.error(f"NEWS FEED ERROR | {ex} | keeping the last calendar" if _NEWS["events"] is not None
+                  else f"NEWS FEED ERROR | {ex} | no calendar yet ({NEWS_FAIL_MODE} trading)")
+    return _NEWS["events"]
+
+
+def news_block(pair, now):
+    if not NEWS_FILTER:
+        return None
+    events = news_events()
+    if events is None:
+        return "news feed unavailable" if NEWS_FAIL_MODE == "block" else None
+    ccys = pair.split("_")
+    for ccy, ts, title in events:
+        if ccy in ccys and abs((ts - now).total_seconds()) <= NEWS_BLOCK_MIN * 60:
+            return f"news ({ccy} {title} at {ts:%H:%M} UTC)"
+    return None
+
+
+def ny_block(now):
+    if not NY_BLOCK:
+        return None
+    try:
+        a, b = NY_BLOCK.split("-")
+        start = int(a.split(":")[0]) * 60 + int(a.split(":")[1])
+        end = int(b.split(":")[0]) * 60 + int(b.split(":")[1])
+    except (ValueError, IndexError):
+        return None
+    t = now.tz_convert("America/New_York")
+    m = t.hour * 60 + t.minute
+    return f"late New York hours ({NY_BLOCK} NY time)" if start <= m < end else None
+
+
+def exposure(trades):
+    """Net same-direction count per currency (long EUR_USD = +1 EUR, -1 USD)."""
+    ex = {}
+    for t in trades:
+        base, quote = t["instrument"].split("_")
+        d = 1 if float(t["currentUnits"]) > 0 else -1
+        ex[base] = ex.get(base, 0) + d
+        ex[quote] = ex.get(quote, 0) - d
+    return ex
+
+
+def exposure_block(ex, pair, direction):
+    base, quote = pair.split("_")
+    if abs(ex.get(base, 0) + direction) > MAX_PER_CURRENCY:
+        return f"too much {base} exposure"
+    if abs(ex.get(quote, 0) - direction) > MAX_PER_CURRENCY:
+        return f"too much {quote} exposure"
+    return None
+
+
+def add_exposure(ex, pair, direction):
+    base, quote = pair.split("_")
+    ex[base] = ex.get(base, 0) + direction
+    ex[quote] = ex.get(quote, 0) - direction
+
+
+def size_units(api, pair, risk_price):
+    """Units so that hitting the stop loses about RISK_PCT% of the balance (falls back to UNITS)."""
+    if RISK_PCT <= 0:
+        return UNITS, "fixed"
+    try:
+        acct = api.get(f"/v3/accounts/{api.account}/summary")["account"]
+        balance, ccy = float(acct["balance"]), acct["currency"]
+        quote = pair.split("_")[1]
+        conv = 1.0 if quote == ccy else _HOME_CONV.get(quote)
+        if conv is None:
+            raise RuntimeError(f"no {quote}->{ccy} rate")
+        units = int(balance * RISK_PCT / 100 / (risk_price * conv))
+        return max(0, min(units, MAX_UNITS)), f"{RISK_PCT:g}% risk"
+    except Exception as e:
+        log.info(f"{pair} | sizing fell back to {UNITS} units ({e})")
+        return UNITS, "fixed (fallback)"
+
+
+def place_order(api, pair, direction, sl, tp=None, size=None):
+    size = UNITS if size is None else size
+    units = size if direction == 1 else -size
     order = {
         "type": "MARKET",
         "instrument": pair,
@@ -1586,7 +1749,7 @@ def manage_flip_exits(api, pair, d, trades_by_pair, open_pairs):
         open_pairs.discard(pair)
 
 
-def process_pair(api, pair, prices, open_pairs, trades_by_pair=None):
+def process_pair(api, pair, prices, open_pairs, trades_by_pair=None, ex=None):
     sig = fetch_recent(api, pair, TIMEFRAME, 500)
     if len(sig) < 200:
         log.info(f"{pair} | NO TRADE | blocked: not enough candles")
@@ -1609,6 +1772,10 @@ def process_pair(api, pair, prices, open_pairs, trades_by_pair=None):
 
     if pair in open_pairs:
         log.info(f"{pair} | {trend} | {side} | blocked: position already open")
+        return
+    safety = ny_block(now) or news_block(pair, now) or (exposure_block(ex, pair, direction) if ex is not None else None)
+    if safety:
+        log.info(f"{pair} | {trend} | {side} | blocked: {safety}")
         return
     if len(open_pairs) >= MAX_OPEN_TRADES:
         log.info(f"{pair} | {trend} | {side} | blocked: max open trades")
@@ -1644,10 +1811,16 @@ def process_pair(api, pair, prices, open_pairs, trades_by_pair=None):
             f"{pair} | {trend} | {side} | SIGNAL ENTRY {fmt_price(pair, entry)} "
             f"SL {fmt_price(pair, sl)} TP {fmt_price(pair, tp)} | RR 1:{RR:.1f}"
         )
-    ok, msg = place_order(api, pair, direction, sl, tp)
-    log.info(f"{pair} | {msg}")
+    units, how = size_units(api, pair, risk)
+    if units < 1:
+        log.info(f"{pair} | {trend} | {side} | SKIPPED: size rounds to 0 units")
+        return
+    ok, msg = place_order(api, pair, direction, sl, tp, units)
+    log.info(f"{pair} | {msg} | {units} units ({how})")
     if ok:
         open_pairs.add(pair)
+        if ex is not None:
+            add_exposure(ex, pair, direction)
 
 
 def live_cycle(api):
@@ -1656,12 +1829,13 @@ def live_cycle(api):
     for t in trades:
         trades_by_pair.setdefault(t["instrument"], []).append(t)
     open_pairs = set(trades_by_pair)
+    ex = exposure(trades)
     prices = get_prices(api)
     log.info(f"--- scan | {len(trades)} open trade(s) | exit {EXIT_MODE} ---")
     evaluated = 0
     for pair in PAIRS:
         try:
-            if process_pair(api, pair, prices, open_pairs, trades_by_pair) is not False:
+            if process_pair(api, pair, prices, open_pairs, trades_by_pair, ex) is not False:
                 evaluated += 1
         except Exception as e:
             log.error(f"{pair} | ERROR | {e}")
@@ -1692,6 +1866,8 @@ def main():
             run_backtest_po3c(api, days)
         elif strategy == "po3e":
             run_backtest_po3e(api, days)
+        elif strategy == "lbo":
+            run_backtest_lbo(api, days)
         else:
             run_backtest(api, days)
         while True:  # idle so Railway does not keep re-running it
@@ -1702,6 +1878,11 @@ def main():
     log.info(
         f"UT+ bot live | {TIMEFRAME} | UT_KEY {UT_KEY:g} | ADX_MIN {ADX_MIN:g} | {len(PAIRS)} pairs | "
         f"units {UNITS} | stop {stop_txt} (min {MIN_STOP_PIPS} pips) | exit {exit_txt}"
+    )
+    log.info(
+        f"safety | size {'%g%% risk (max %d units)' % (RISK_PCT, MAX_UNITS) if RISK_PCT > 0 else 'fixed %d units' % UNITS} | "
+        f"max {MAX_PER_CURRENCY} per currency | news filter {'on, %d min' % NEWS_BLOCK_MIN if NEWS_FILTER else 'off'} | "
+        f"no trades {NY_BLOCK or 'none'} NY time"
     )
     while True:
         wait = seconds_to_next_bar()
