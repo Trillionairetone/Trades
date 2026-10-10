@@ -2594,7 +2594,7 @@ def run_backtest_tsm(api, days):
 #   Holdout results are ONLY printed for signals that pass the search, so nothing can be cherry-picked.
 #   Cost control: EUR_USD + USD_JPY only, entries only in the London-New York overlap (08:00-12:00 New York),
 #   stop = 0.5 x daily ATR(20) (wide, so spread is a small share), target 1:1 or 1:2,
-#   every trade closed by 16:45 New York (no overnight swap). One trade per signal per day per pair.
+#   every trade closed by 15:00 New York (clear of the 17:00 rollover spread; no swap). One trade per signal per day per pair.
 #   Signals (each tested as "f" = follow and "x" = fade/opposite, at 1:1 and 1:2):
 #     LDN   London session direction 03:00->08:00 NY, enter 08:00
 #     NY1H  first New York hour 08:00->09:00, enter 09:00
@@ -2610,6 +2610,7 @@ SCAN_PAIRS = [p.strip().upper() for p in os.getenv("SCAN_PAIRS", "EUR_USD,USD_JP
 SCAN_START = os.getenv("SCAN_START", "2014-01-01")
 SCAN_SPLIT = os.getenv("SCAN_SPLIT", "2020-01-01")
 SCAN_STOP_DATR = _f("SCAN_STOP_DATR", 0.5)
+SCAN_EXIT_MOD = _i("SCAN_EXIT_HOUR", 15) * 60 - 15   # last candle held: 14:45 NY, so trades close at 15:00 (away from the 17:00 rollover spread)
 
 
 def scan_entries(d, pair):
@@ -2685,7 +2686,7 @@ def scan_simulate(d, pair, entries, mod, datr, rr, flip):
         sl, tp = entry - dirn * risk, entry + dirn * rr * risk
         r, k = None, e
         while k < n:
-            if k > e and (mod[k] > 1005 or mod[k] < mod[e]):   # past the 16:45 NY candle or into the next day
+            if k > e and (mod[k] > SCAN_EXIT_MOD or mod[k] < mod[e]):   # past the exit candle or into the next day
                 k -= 1
                 break
             if dirn == 1:
@@ -2698,14 +2699,15 @@ def scan_simulate(d, pair, entries, mod, datr, rr, flip):
                     r = -1.0; break
                 if al[k] <= tp:
                     r = rr; break
-            if mod[k] == 1005:                                    # the 16:45 candle: close at its close
+            if mod[k] == SCAN_EXIT_MOD:                           # the exit candle: close at its close
                 break
             k += 1
         k = min(max(k, e), n - 1)
         if r is None:
             r = dirn * ((bc[k] if dirn == 1 else ac[k]) - entry) / risk
         trades.append({"pair": pair, "entry": t[e], "exit": t[k], "dir": dirn, "r": float(r),
-                       "risk_pips": risk / pip(pair), "spread_frac": spread / risk})
+                       "risk_pips": risk / pip(pair), "spread_frac": spread / risk,
+                       "exit_spread": (ac[k] - bc[k]) / risk, "timed": r not in (-1.0, rr)})
     return trades
 
 
@@ -2786,8 +2788,10 @@ def run_scan(api, days):
             log.info(f"   {k} holdout by pair: {per}")
     allr = [x for v in search.values() for x in v]
     if allr:
-        log.info(f"Avg stop {np.mean([x['risk_pips'] for x in allr]):.1f} pips, spread "
-                 f"{np.mean([x['spread_frac'] for x in allr]) * 100:.1f}% of risk.")
+        log.info(f"Avg stop {np.mean([x['risk_pips'] for x in allr]):.1f} pips | entry spread "
+                 f"{np.mean([x['spread_frac'] for x in allr]) * 100:.1f}% of risk | spread at timed exits "
+                 f"{np.mean([x['exit_spread'] for x in allr if x['timed']] or [0]) * 100:.1f}% of risk | "
+                 f"{np.mean([x['timed'] for x in allr]) * 100:.0f}% of trades closed by the time exit")
     log.info("A signal counts only if it passes SEARCH and then HOLDOUT. Then it goes to the demo account first.")
     log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
 
