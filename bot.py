@@ -15,7 +15,8 @@ Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
          BACKTEST_STRATEGY=po3x tunes Power Of Three + Echo exits (stop beyond the fake move, target the range)
          BACKTEST_STRATEGY=smc  backtests YOUR strategy: H4+H1+M15 trend aligned, break of structure,
                                 entry on the pullback into the fair value gap / retest, structural stop
-         BACKTEST_STRATEGY=combo backtests your strategy + Power Of Three together (fake move against the
+         BACKTEST_STRATEGY=smce tests 3 entries for your strategy: limit pullback vs market at the break vs confirmation candle
+        BACKTEST_STRATEGY=combo backtests your strategy + Power Of Three together (fake move against the
                                 H4/H1 trend, then your break of structure back with it)
          BACKTEST_END_DAYS=N   ends the test window N days ago (to test an untouched past period)
 Safety : live entries are skipped near high-impact news (free Forex Factory feed), in the late New York
@@ -1782,7 +1783,7 @@ def h4_levels(h4, n):
     return np.array(out_t, dtype=np.int64), np.array(out_p)
 
 
-def simulate_smc(d, pair, start_ts, end_ts, ctx, rr, use_level):
+def simulate_smc(d, pair, start_ts, end_ts, ctx, rr, use_level, entry_mode="limit"):
     t = d["time"].tolist()
     h, l, c = d["h"].to_numpy(), d["l"].to_numpy(), d["c"].to_numpy()
     bo, bh, bl, bc = (d[k].to_numpy() for k in ("bo", "bh", "bl", "bc"))
@@ -1830,31 +1831,59 @@ def simulate_smc(d, pair, start_ts, end_ts, ctx, rr, use_level):
             if r is not None:
                 record(pos, i, r)
                 pos = None
-        # 2) pending limit order on the pullback
+        # 2) pending entry: limit (pullback), market (at the break) or confirm (touch + rejection candle)
         elif pos is None and pending is not None and i > pending["created"]:
-            if i - pending["created"] > SMC_WAIT:
+            dirn, E, mode = pending["dir"], pending["entry"], pending.get("mode", "limit")
+            fill = None
+            if mode == "market":
+                if not blocked[i]:
+                    fill = ao[i] if dirn == 1 else bo[i]          # next candle's open, paying the spread
+                else:
+                    skip["expired"] += 1
+                if fill is None:
+                    pending = None
+            elif i - pending["created"] > SMC_WAIT and not pending.get("go"):
                 skip["expired"] += 1
                 pending = None
+            elif mode == "confirm":
+                if pending.get("go"):
+                    if not blocked[i]:
+                        fill = ao[i] if dirn == 1 else bo[i]
+                    else:
+                        skip["expired"] += 1
+                        pending = None
+                else:
+                    sl0 = pending["sl"]
+                    if (dirn == 1 and bl[i] <= sl0) or (dirn == -1 and ah[i] >= sl0):
+                        skip["stopped before confirm"] = skip.get("stopped before confirm", 0) + 1
+                        pending = None
+                    else:
+                        if (dirn == 1 and al[i] <= E) or (dirn == -1 and bh[i] >= E):
+                            pending["touched"] = True
+                        if pending.get("touched"):
+                            # rejection: candle closes back on the trend side of the zone, in the trend direction
+                            if (dirn == 1 and bc[i] > E and bc[i] > bo[i]) or (dirn == -1 and ac[i] < E and ac[i] < ao[i]):
+                                pending["go"] = True                # enter at the next candle's open
             elif not blocked[i]:
-                dirn, E = pending["dir"], pending["entry"]
                 if (dirn == 1 and al[i] <= E) or (dirn == -1 and bh[i] >= E):
                     fill = min(E, ao[i]) if dirn == 1 else max(E, bo[i])
-                    sl = pending["sl"]
-                    risk = dirn * (fill - sl)
-                    if risk < minr:
-                        risk = minr
-                        sl = fill - dirn * risk
-                    spread = ao[i] - bo[i]
-                    pending = None
-                    if spread > MAX_SPREAD_RISK * risk:
-                        skip["spread"] += 1
+            if fill is not None and pending is not None:
+                sl = pending["sl"]
+                risk = dirn * (fill - sl)
+                if risk < minr:
+                    risk = minr
+                    sl = fill - dirn * risk
+                spread = ao[i] - bo[i]
+                pending = None
+                if spread > MAX_SPREAD_RISK * risk:
+                    skip["spread"] += 1
+                else:
+                    p = {"dir": dirn, "entry": fill, "sl": sl, "tp": fill + dirn * rr * risk, "risk": risk,
+                         "fill": i, "t": t[i], "spread": spread, "record": start_ts <= t[i] < end_ts}
+                    if (dirn == 1 and bl[i] <= sl) or (dirn == -1 and ah[i] >= sl):
+                        record(p, i, -1.0)      # filled and stopped in the same candle: count the loss
                     else:
-                        p = {"dir": dirn, "entry": fill, "sl": sl, "tp": fill + dirn * rr * risk, "risk": risk,
-                             "fill": i, "t": t[i], "spread": spread, "record": start_ts <= t[i] < end_ts}
-                        if (dirn == 1 and bl[i] <= sl) or (dirn == -1 and ah[i] >= sl):
-                            record(p, i, -1.0)      # filled and stopped in the same candle: count the loss
-                        else:
-                            pos = p
+                        pos = p
         # 3) swings confirmed this candle
         q = i - S
         if q - S >= 0:
@@ -1896,7 +1925,7 @@ def simulate_smc(d, pair, start_ts, end_ts, ctx, rr, use_level):
             if use_level and not near_level(E, i):
                 skip["no key level"] += 1
                 continue
-            pending = {"dir": dirn, "entry": E, "sl": stop_ref - dirn * 0.1 * atr[i], "created": i}
+            pending = {"dir": dirn, "entry": E, "sl": stop_ref - dirn * 0.1 * atr[i], "created": i, "mode": entry_mode}
     if pos is not None:
         record(pos, n - 1, pos["dir"] * ((bc[n - 1] if pos["dir"] == 1 else ac[n - 1]) - pos["entry"]) / pos["risk"])
     return trades, skip
@@ -1976,6 +2005,66 @@ def run_backtest_smc(api, days):
     sk = skips["1:3 +Lvl"]
     log.info("Setups not taken (1:3 +Lvl): " + (", ".join(f"{k2} {v}" for k2, v in sk.items() if v) or "none"))
     log.info("Need: avgR above 0 in BOTH halves, PF above 1.2, a few hundred trades.")
+    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+
+
+# ----------------------------------------------------------------------------
+# BACKTEST: entry-method test for your strategy (rules fixed before testing)
+#   Same setups as BACKTEST_STRATEGY=smc (H4+H1+M15 trend, M15 break of structure, structural stop).
+#   Only the ENTRY changes:
+#     Limit   = current rule: limit order at the FVG/retest, waits up to SMC_WAIT candles
+#     Market  = enter at the open of the candle right after the break (no waiting, no missed trades)
+#     Confirm = wait for price to touch the FVG/retest, then a candle that closes back in the trend
+#               direction (a rejection); enter at the next open. Cancelled if the stop is hit first.
+#   Shown at 1:2 and 1:3. Pass bar: Market or Confirm must beat Limit AND have avgR > 0 in both halves, PF >= 1.2.
+# ----------------------------------------------------------------------------
+def run_backtest_smce(api, days):
+    now = datetime.now(timezone.utc)
+    end = now - timedelta(days=BACKTEST_END_DAYS)
+    start = end - timedelta(days=days)
+    start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+    log.info(f"BACKTEST | your strategy - ENTRY TEST (limit vs market vs confirm) | {TIMEFRAME} | "
+             f"{start:%Y-%m-%d} to {end:%Y-%m-%d} | pairs {SMC_PAIRS}")
+    variants = {}
+    short = {"limit": "Lim", "market": "Mkt", "confirm": "Conf"}
+    for mode in ("limit", "market", "confirm"):
+        for rr in (2.0, 3.0):
+            variants[f"{short[mode]} 1:{int(rr)}"] = (mode, rr)
+    rows = {k: [] for k in variants}
+    skips = {k: {} for k in variants}
+    for pair in SMC_PAIRS:
+        try:
+            m15 = fetch_range(api, pair, TIMEFRAME, start - timedelta(days=10))
+            h1 = fetch_range(api, pair, "H1", start - timedelta(days=40))
+            h4 = fetch_range(api, pair, "H4", start - timedelta(days=120))
+            if len(m15) < 500 or len(h1) < 100 or len(h4) < 100:
+                log.info(f"{pair} | not enough history, skipped")
+                continue
+            ctx = build_smc_ctx(m15, h1, h4)
+            for name, (mode, rr) in variants.items():
+                tr, sk = simulate_smc(m15, pair, start_ts, end_ts, ctx, rr, False, mode)
+                rows[name] += tr
+                for k2, v in sk.items():
+                    skips[name][k2] = skips[name].get(k2, 0) + v
+            log.info(f"{pair} | done")
+        except Exception as e:
+            log.error(f"{pair} | BACKTEST ERROR | {e}")
+
+    log.info("")
+    log.info(f"===== ENTRY TEST | {TIMEFRAME} | {start:%Y} to {end:%Y} | results in R =====")
+    log.info(f"{'':<8}{'n':>5}{'win':>6}{'avgR':>6}{'PF':>5}{'1st':>6}{'2nd':>6}")
+    for name, tr in rows.items():
+        log.info(_summary_line(name, tr))
+    log.info("Coin-flip win rates to beat: 1:2 = 33%, 1:3 = 25% (before spread).")
+    months = max(days / 30.4, 1)
+    for mode in ("Lim", "Mkt", "Conf"):
+        base = rows[f"{mode} 1:3"]
+        if base:
+            log.info(f"{mode} 1:3: avg stop {np.mean([x['risk_pips'] for x in base]):.1f} pips, spread "
+                     f"{np.mean([x['spread_frac'] for x in base]) * 100:.1f}% of risk, {len(base) / months:.1f} trades/month")
+        sk = skips[f"{mode} 1:3"]
+        log.info(f"{mode} setups not taken: " + (", ".join(f"{k2} {v}" for k2, v in sk.items() if v) or "none"))
+    log.info("Pass: Market or Confirm beats Limit AND avgR > 0 in BOTH halves, PF >= 1.2.")
     log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
 
 
@@ -2461,6 +2550,8 @@ def main():
             run_backtest_smc(api, days)
         elif strategy == "combo":
             run_backtest_combo(api, days)
+        elif strategy == "smce":
+            run_backtest_smce(api, days)
         else:
             run_backtest(api, days)
         while True:  # idle so Railway does not keep re-running it
