@@ -3749,7 +3749,8 @@ def main():
     api = Oanda()
     if mode == "backtest":
         days = int(sys.argv[2]) if len(sys.argv) > 2 else _i("BACKTEST_DAYS", 90)
-        strategy = os.getenv("BACKTEST_STRATEGY", "ut").lower()
+        strategy = os.getenv("BACKTEST_STRATEGY", "ut").strip().lower()
+        log.info(f"BACKTEST_STRATEGY read as '{strategy}' (TIMEFRAME {TIMEFRAME}, BACKTEST_DAYS {days})")
         if strategy == "srbb":
             run_backtest_srbb(api, days)
         elif strategy == "flux":
@@ -3786,8 +3787,11 @@ def main():
             run_backtest_po3tools(api, days)
         elif strategy == "brk":
             run_backtest_breakout(api, days)
-        else:
+        elif strategy == "ut":
             run_backtest(api, days)
+        else:
+            log.error(f"Unknown BACKTEST_STRATEGY '{strategy}'. Check the spelling in Railway. Options include: ut, srbb, "
+                      "flux, po3s, po3c, po3e, lbo, po3x, smc, smce, combo, po3v2, po3w, tsm, scan, sax, xgb, po3tools, brk")
         while True:  # idle so Railway does not keep re-running it
             time.sleep(3600)
 
