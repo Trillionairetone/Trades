@@ -24,6 +24,7 @@ Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
         BACKTEST_STRATEGY=xgb  GainzAlgo XG Boost Lite reversals (rolling ML model) vs the same pivots without the model
         BACKTEST_STRATEGY=po3tools PO3 + Echo entries with the ATR calculator / ATR plotter / TrendGenY stops & targets
         BACKTEST_STRATEGY=brk  TD Forex Breakout (EMA50/200 + 20-candle breakout + volume) with cost lessons applied
+        BACKTEST_STRATEGY=news reaction to US jobs report + CPI (FRED release dates, needs FRED_API_KEY)
         BACKTEST_STRATEGY=combo backtests your strategy + Power Of Three together (fake move against the
                                 H4/H1 trend, then your break of structure back with it)
          BACKTEST_END_DAYS=N   ends the test window N days ago (to test an untouched past period)
@@ -3487,6 +3488,173 @@ def run_backtest_breakout(api, days):
 
 
 # ----------------------------------------------------------------------------
+# NEWS REACTION TEST (rules fixed before testing)
+#   Release dates come from FRED (Federal Reserve Bank of St. Louis), key in FRED_API_KEY:
+#     Employment Situation (jobs report / NFP, FRED release 50) and Consumer Price Index (CPI, release 10),
+#     both published at 08:30 New York time.
+#   Pairs: EUR_USD, USD_JPY, GBP_USD (M15, real bid/ask).
+#   Signal: direction of the release candle (08:30-08:45 New York). Entry at the 08:45 open.
+#     f = follow that direction, x = fade it. Stop = 0.5 x daily ATR(20), target 1R or 2R,
+#     anything still open is closed at 12:00 New York (well before the 17:00 rollover).
+#     "big" rows: only events whose release candle moved more than 0.3 x daily ATR (a large reaction).
+#   SEARCH = SCAN_START..SCAN_SPLIT (default 2014-2020), HOLDOUT = SCAN_SPLIT..today, shown only for search passers.
+#   SEARCH pass: 150+ trades, PF >= 1.3, avgR > 0 in both halves, at least 2 of 3 pairs positive.
+#   HOLDOUT pass: avgR > 0 in both halves, PF >= 1.2, at least 2 of 3 pairs positive.
+# ----------------------------------------------------------------------------
+NEWS_PAIRS = [p.strip().upper() for p in os.getenv("NEWS_PAIRS", "EUR_USD,USD_JPY,GBP_USD").split(",") if p.strip()]
+NEWS_RELEASES = {"NFP": 50, "CPI": 10}
+
+
+def fred_release_dates(release_id, start):
+    key = os.getenv("FRED_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("FRED_API_KEY is missing in Railway variables")
+    r = requests.get("https://api.stlouisfed.org/fred/release/dates", timeout=30, params={
+        "release_id": release_id, "api_key": key, "file_type": "json", "realtime_start": start,
+        "realtime_end": "9999-12-31", "sort_order": "asc", "limit": 10000,
+        "include_release_dates_with_no_data": "false"})
+    if r.status_code != 200:
+        raise RuntimeError(f"FRED error {r.status_code}: {r.text[:200]}")
+    today = datetime.now(timezone.utc).date()
+    out = sorted({x["date"] for x in r.json().get("release_dates", []) if pd.Timestamp(x["date"]).date() < today})
+    return out
+
+
+def _news_checks(tr, pf_min, n_min):
+    s = stats(tr)
+    o = sorted(tr, key=lambda x: x["entry"])
+    h2 = len(o) // 2
+    if s["n"] < n_min or s["pf"] < pf_min or h2 == 0:
+        return False
+    if stats(o[:h2])["avg"] <= 0 or stats(o[h2:])["avg"] <= 0:
+        return False
+    pos = sum(1 for p in NEWS_PAIRS if any(x["pair"] == p for x in tr) and np.mean([x["r"] for x in tr if x["pair"] == p]) > 0)
+    return pos >= 2
+
+
+def run_news(api, days):
+    t0 = pd.Timestamp(SCAN_START, tz="UTC")
+    split = pd.Timestamp(SCAN_SPLIT, tz="UTC")
+    log.info(f"NEWS | reaction test | search {t0:%Y-%m-%d} to {split:%Y-%m-%d} | holdout to today | pairs {NEWS_PAIRS}")
+    events = []
+    for name, rid in NEWS_RELEASES.items():
+        try:
+            ds = [d for d in fred_release_dates(rid, SCAN_START) if pd.Timestamp(d, tz="UTC") >= t0]
+        except Exception as e:
+            log.error(f"FRED | {name} | {e}")
+            continue
+        wd = pd.Series([pd.Timestamp(d).day_name() for d in ds]).value_counts()
+        log.info(f"FRED | {name} | {len(ds)} release dates {ds[0] if ds else '-'} to {ds[-1] if ds else '-'} | "
+                 f"most common day {wd.index[0] if len(wd) else '-'} ({(wd.iloc[0] / max(len(ds), 1)) * 100:.0f}%)")
+        for d in ds:
+            rel = pd.Timestamp(f"{d} 08:30", tz="America/New_York").tz_convert("UTC")
+            events.append((name, rel))
+    if not events:
+        log.error("NEWS | no release dates - check FRED_API_KEY")
+        return
+    rows = {f"{k} {tag}{rr:g}": [] for k in ("all", "big") for tag in ("f", "x") for rr in (1.0, 2.0)}
+    for pair in NEWS_PAIRS:
+        try:
+            d = fetch_range(api, pair, "M15", (t0 - pd.Timedelta(days=40)).to_pydatetime())
+            if len(d) < 5000:
+                log.info(f"{pair} | not enough history, skipped")
+                continue
+            t = d["time"]
+            pos = {ts.value: i for i, ts in enumerate(t)}
+            ny = t.dt.tz_convert("America/New_York")
+            mod = (ny.dt.hour * 60 + ny.dt.minute).to_numpy()
+            sd = (ny + pd.Timedelta(hours=7)).dt.date
+            dly = d.groupby(sd.to_numpy()).agg(h=("h", "max"), l=("l", "min"), c=("c", "last"))
+            pc = dly["c"].shift(1)
+            trr = np.maximum(dly["h"] - dly["l"], np.maximum((dly["h"] - pc).abs(), (dly["l"] - pc).abs()))
+            datr = trr.rolling(20).mean().shift(1).to_dict()
+            o, c = d["o"].to_numpy(), d["c"].to_numpy()
+            bo, bh, bl, bc = (d[k].to_numpy() for k in ("bo", "bh", "bl", "bc"))
+            ao, ah, al, ac = (d[k].to_numpy() for k in ("ao", "ah", "al", "ac"))
+            n = len(d)
+            used = 0
+            for name, rel in events:
+                i = pos.get(rel.value)
+                if i is None or i + 1 >= n or t.iloc[i + 1] != rel + pd.Timedelta(minutes=15):
+                    continue
+                a = datr.get(sd.iloc[i])
+                if a is None or np.isnan(a) or a <= 0:
+                    continue
+                move = c[i] - o[i]
+                if move == 0:
+                    continue
+                used += 1
+                big = abs(move) > 0.3 * a
+                base_dir = 1 if move > 0 else -1
+                j = i + 1
+                for tag in ("f", "x"):
+                    dirn = base_dir if tag == "f" else -base_dir
+                    entry = ao[j] if dirn == 1 else bo[j]
+                    risk = 0.5 * a
+                    for rr in (1.0, 2.0):
+                        sl, tp = entry - dirn * risk, entry + dirn * rr * risk
+                        r, k = None, j
+                        while k < n and mod[k] < 720 and (k == j or mod[k] >= mod[j]):
+                            if dirn == 1:
+                                if bl[k] <= sl:
+                                    r = -1.0; break
+                                if bh[k] >= tp:
+                                    r = rr; break
+                            else:
+                                if ah[k] >= sl:
+                                    r = -1.0; break
+                                if al[k] <= tp:
+                                    r = rr; break
+                            k += 1
+                        if r is None:
+                            k = max(j, k - 1)
+                            r = dirn * ((bc[k] if dirn == 1 else ac[k]) - entry) / risk
+                        tr = {"pair": pair, "event": name, "entry": t.iloc[j], "exit": t.iloc[k], "dir": dirn, "r": float(r),
+                              "risk_pips": risk / pip(pair), "spread_frac": (ao[j] - bo[j]) / risk}
+                        rows[f"all {tag}{rr:g}"].append(tr)
+                        if big:
+                            rows[f"big {tag}{rr:g}"].append(tr)
+            log.info(f"{pair} | done | {used} release candles found")
+            del d
+            gc.collect()
+        except Exception as e:
+            log.error(f"{pair} | NEWS ERROR | {e}")
+
+    search = {k: [x for x in v if x["entry"] < split] for k, v in rows.items()}
+    hold = {k: [x for x in v if x["entry"] >= split] for k, v in rows.items()}
+    log.info("")
+    log.info(f"===== NEWS REACTION | SEARCH {t0:%Y}-{split:%Y} | NFP + CPI | results in R =====")
+    log.info("f = follow the first 15 min, x = fade it, number = target in R. Coin flip: 1:1 = 50%, 1:2 = 33%.")
+    log.info(f"{'':<10}{'n':>5}{'win':>6}{'avgR':>6}{'PF':>5}{'1st':>6}{'2nd':>6}")
+    for k, v in search.items():
+        if v:
+            log.info(_scan_line(k, v))
+    for k in ("all f1", "all x1"):
+        for ev in NEWS_RELEASES:
+            sub = [x for x in search[k] if x["event"] == ev]
+            if sub:
+                log.info(f"   {k} {ev} only: n {len(sub)}, avgR {np.mean([x['r'] for x in sub]):+.2f}")
+    passed = [k for k, v in search.items() if v and _news_checks(v, 1.3, 150)]
+    log.info(f"SEARCH passes: {len(passed)} -> {passed if passed else 'none'}")
+    if passed:
+        log.info("")
+        log.info(f"===== HOLDOUT {split:%Y}-today (passers only, first time seen) =====")
+        log.info(f"{'':<10}{'n':>5}{'win':>6}{'avgR':>6}{'PF':>5}{'1st':>6}{'2nd':>6}")
+        for k in passed:
+            ok = bool(hold[k]) and _news_checks(hold[k], 1.2, 1)
+            log.info(_scan_line(k, hold[k]) + ("  PASS" if ok else "  fail") if hold[k] else f"{k}: no holdout trades")
+            per = ", ".join(f"{p} {np.mean([x['r'] for x in hold[k] if x['pair'] == p]):+.2f}"
+                            for p in NEWS_PAIRS if any(x["pair"] == p for x in hold[k]))
+            log.info(f"   {k} holdout by pair: {per}")
+    allr = [x for v in search.values() for x in v]
+    if allr:
+        log.info(f"Avg stop {np.mean([x['risk_pips'] for x in allr]):.1f} pips | spread at the 08:45 entry "
+                 f"{np.mean([x['spread_frac'] for x in allr]) * 100:.1f}% of risk")
+    log.info("A row counts only if it passes SEARCH and then HOLDOUT. Then it goes to the demo account first.")
+    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+
+
+# ----------------------------------------------------------------------------
 # LIVE
 # ----------------------------------------------------------------------------
 _NEWS = {"t": 0.0, "events": None}
@@ -3787,11 +3955,13 @@ def main():
             run_backtest_po3tools(api, days)
         elif strategy == "brk":
             run_backtest_breakout(api, days)
+        elif strategy == "news":
+            run_news(api, days)
         elif strategy == "ut":
             run_backtest(api, days)
         else:
             log.error(f"Unknown BACKTEST_STRATEGY '{strategy}'. Check the spelling in Railway. Options include: ut, srbb, "
-                      "flux, po3s, po3c, po3e, lbo, po3x, smc, smce, combo, po3v2, po3w, tsm, scan, sax, xgb, po3tools, brk")
+                      "flux, po3s, po3c, po3e, lbo, po3x, smc, smce, combo, po3v2, po3w, tsm, scan, sax, xgb, po3tools, brk, news")
         while True:  # idle so Railway does not keep re-running it
             time.sleep(3600)
 
