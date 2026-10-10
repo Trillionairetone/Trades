@@ -20,6 +20,7 @@ Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
         BACKTEST_STRATEGY=po3w wide test of PO3 + Echo (12 pairs, full history, + confirmation variants)
         BACKTEST_STRATEGY=tsm  daily trend-following (time-series momentum, 3/6/12-month lookbacks, 12 pairs)
         BACKTEST_STRATEGY=scan M15 signal scanner (10 timing/level signals, search 2014-2020, holdout 2020-today)
+        BACKTEST_STRATEGY=sax  volume-drift SuperTrend (Swift Algo X style) + 144-combo walk-forward optimizer
         BACKTEST_STRATEGY=combo backtests your strategy + Power Of Three together (fake move against the
                                 H4/H1 trend, then your break of structure back with it)
          BACKTEST_END_DAYS=N   ends the test window N days ago (to test an untouched past period)
@@ -2797,6 +2798,225 @@ def run_scan(api, days):
 
 
 # ----------------------------------------------------------------------------
+# BACKTEST: "Swift Algo X"-style volume-drift SuperTrend + 144-combo optimizer (rules fixed before testing)
+#   The original is closed source, so this rebuilds it from its published description:
+#     volume-weighted pressure  vp = tick volume x (close - open) / (high - low)
+#     dual EMA spread           m  = EMA(vp, P/2) - EMA(vp, P)
+#     std normalisation         z  = m / stdev(m, P), capped at +/-3
+#     ATR rescale + projection  ref = (high + low)/2 + z x ATR(P)
+#     trailing band             SuperTrend bands at ref +/- M x ATR(P); flip when close crosses the band
+#   Trades: stop-and-reverse on every flip, filled at the next open (bid/ask). 1R = distance from entry to the
+#   band at the signal (min 0.5 ATR). Optimizer grid: M = 1.0..6.5 (12) x P = 5..60 (12) = 144 combos.
+#   Rows (all scored only on the same out-of-sample years):
+#     Default  = fixed M=3, P=20
+#     Best*    = the single best combo chosen WITH HINDSIGHT on the scored years (what an optimizer shows you;
+#                not tradable - you cannot know it in advance)
+#     WF-Win   = walk-forward, picks highest WIN RATE on the previous 12 months, trades the next 6 (like the script)
+#     WF-R     = walk-forward, picks highest avgR instead
+#     WF-R+Tr  = WF-R, only taking signals where H1 and H4 SuperTrend agree and H1 ADX > 20 (trend dashboard stand-in)
+#   Note: forex has no central volume; OANDA "volume" is tick count.
+#   Pass: a walk-forward row with avgR > 0 in BOTH halves, PF >= 1.2, a few hundred trades.
+# ----------------------------------------------------------------------------
+SAX_MULTS = [1.0 + 0.5 * k for k in range(12)]
+SAX_PERIODS = [5 * (k + 1) for k in range(12)]
+
+
+def supertrend_dir(df, period=10, mult=3.0):
+    atr = calc_atr(df, period).tolist()
+    hl2 = ((df["h"] + df["l"]) / 2).tolist()
+    c = df["c"].tolist()
+    n = len(c)
+    out = [0] * n
+    fu = fl = None
+    trend = 1
+    for i in range(n):
+        a = atr[i]
+        if a != a:
+            continue
+        ub, lb = hl2[i] + mult * a, hl2[i] - mult * a
+        if fu is None:
+            fu, fl = ub, lb
+        else:
+            fu = ub if (ub < fu or c[i - 1] > fu) else fu
+            fl = lb if (lb > fl or c[i - 1] < fl) else fl
+        if trend == -1 and c[i] > fu:
+            trend = 1
+        elif trend == 1 and c[i] < fl:
+            trend = -1
+        out[i] = trend
+    return np.array(out)
+
+
+def sax_trend_ok(d):
+    """Per M15 candle: +1/-1 when H1 and H4 SuperTrend agree and H1 ADX > 20 (using only completed HTF candles), else 0."""
+    base = d.set_index("time")
+    res = []
+    for rule, hours in (("1h", 1), ("4h", 4)):
+        g = base.resample(rule, label="left", closed="left").agg({"o": "first", "h": "max", "l": "min", "c": "last"}).dropna()
+        g = g.reset_index()
+        g["dir"] = supertrend_dir(g)
+        if hours == 1:
+            g["adx"] = calc_adx(g, 14).to_numpy()
+        g["avail"] = g["time"] + pd.Timedelta(hours=hours)
+        cols = ["avail", "dir"] + (["adx"] if hours == 1 else [])
+        m = pd.merge_asof(d[["time"]], g[cols].rename(columns={"dir": f"d{hours}"}), left_on="time", right_on="avail")
+        res.append(m)
+    d1, d4, adx = res[0]["d1"].to_numpy(), res[1]["d4"].to_numpy(), res[0]["adx"].to_numpy()
+    ok = np.where((d1 == d4) & (adx > 20), d1, 0)
+    return np.nan_to_num(ok).astype(int)
+
+
+def sax_simulate(d, pair, period, mult, trend_ok, t_from):
+    o, h, l, c = (d[k] for k in ("o", "h", "l", "c"))
+    vol = d["volume"].astype(float)
+    rng = (h - l).replace(0, np.nan)
+    vp = (vol * (c - o) / rng).fillna(0.0)
+    fast = vp.ewm(span=max(2, period // 2), adjust=False).mean()
+    slow = vp.ewm(span=period, adjust=False).mean()
+    m = fast - slow
+    z = (m / m.rolling(period).std().replace(0, np.nan)).clip(-3, 3)
+    atr_s = calc_atr(d, period)
+    ref = ((h + l) / 2 + z * atr_s).tolist()
+    atr = atr_s.tolist()
+    cl = c.tolist()
+    t = d["time"].tolist()
+    bo, ao, bc, ac = d["bo"].tolist(), d["ao"].tolist(), d["bc"].tolist(), d["ac"].tolist()
+    n = len(cl)
+    trades = []
+    fu = fl = None
+    trend = 0
+    pos = None
+    for i in range(n - 1):
+        a, rf = atr[i], ref[i]
+        if a != a or rf != rf:
+            continue
+        ub, lb = rf + mult * a, rf - mult * a
+        if fu is None:
+            fu, fl = ub, lb
+            continue
+        fu = ub if (ub < fu or cl[i - 1] > fu) else fu
+        fl = lb if (lb > fl or cl[i - 1] < fl) else fl
+        new = trend
+        if trend <= 0 and cl[i] > fu:
+            new = 1
+        elif trend >= 0 and cl[i] < fl:
+            new = -1
+        if new == trend:
+            continue
+        trend = new
+        j = i + 1
+        if pos is not None:
+            px = bo[j] if pos["dir"] == 1 else ao[j]
+            r = pos["dir"] * (px - pos["entry"]) / pos["risk"]
+            if pos["t"] >= t_from:
+                trades.append({"pair": pair, "entry": pos["t"], "exit": t[j], "dir": pos["dir"], "r": float(r),
+                               "risk_pips": pos["risk"] / pip(pair), "spread_frac": pos["spread"] / pos["risk"],
+                               "ok": pos["ok"]})
+        entry = ao[j] if trend == 1 else bo[j]
+        band = fl if trend == 1 else fu
+        risk = max(abs(entry - band), 0.5 * a)
+        pos = {"dir": trend, "entry": entry, "risk": risk, "t": t[j], "spread": ao[j] - bo[j],
+               "ok": trend_ok[i] == trend}
+    return trades
+
+
+def run_backtest_sax(api, days):
+    now = datetime.now(timezone.utc)
+    end = now - timedelta(days=BACKTEST_END_DAYS)
+    score_start = end - timedelta(days=days)
+    fetch_start = score_start - timedelta(days=395)        # 12 months of training before the first scored window
+    ss = pd.Timestamp(score_start)
+    log.info(f"BACKTEST | volume-drift SuperTrend + 144-combo optimizer (walk-forward) | {TIMEFRAME} | scored "
+             f"{score_start:%Y-%m-%d} to {end:%Y-%m-%d} | pairs {SMC_PAIRS}")
+    rows = {"Default": [], "Best*": [], "WF-Win": [], "WF-R": [], "WF-R+Tr": []}
+    picks = []
+    for pair in SMC_PAIRS:
+        try:
+            d = fetch_range(api, pair, TIMEFRAME, fetch_start)
+            d = d[d["time"] < pd.Timestamp(end)].reset_index(drop=True)
+            if len(d) < 5000:
+                log.info(f"{pair} | not enough history, skipped")
+                continue
+            tok = sax_trend_ok(d)
+            first = pd.Timestamp(fetch_start)
+
+            def pack(tr):            # compact arrays instead of thousands of dicts (keeps memory low on Railway)
+                return {"t": np.array([x["entry"].value for x in tr], dtype=np.int64),
+                        "x": np.array([x["exit"].value for x in tr], dtype=np.int64),
+                        "r": np.array([x["r"] for x in tr]), "ok": np.array([x["ok"] for x in tr], dtype=bool),
+                        "dir": np.array([x["dir"] for x in tr], dtype=np.int8),
+                        "rp": np.array([x["risk_pips"] for x in tr]), "sf": np.array([x["spread_frac"] for x in tr])}
+
+            def unpack(pk, mask):
+                return [{"pair": pair, "entry": pd.Timestamp(int(tv), tz="UTC"), "exit": pd.Timestamp(int(xv), tz="UTC"),
+                         "dir": int(dv), "r": float(rv), "risk_pips": float(rp), "spread_frac": float(sf), "ok": bool(ok)}
+                        for tv, xv, dv, rv, rp, sf, ok in zip(pk["t"][mask], pk["x"][mask], pk["dir"][mask], pk["r"][mask],
+                                                              pk["rp"][mask], pk["sf"][mask], pk["ok"][mask])]
+
+            def qstats(r):
+                if len(r) == 0:
+                    return 0.0, 0.0
+                return float(np.mean(r > 0)), float(np.mean(r))
+
+            allc = {}
+            for P in SAX_PERIODS:
+                for M in SAX_MULTS:
+                    allc[(P, M)] = pack(sax_simulate(d, pair, P, M, tok, first))
+            ssv = ss.value
+            rows["Default"] += unpack(allc[(20, 3.0)], allc[(20, 3.0)]["t"] >= ssv)
+            def score_avg(k):
+                r = allc[k]["r"][allc[k]["t"] >= ssv]
+                return float(np.mean(r)) if len(r) >= 30 else -9.0
+            best = max(allc, key=score_avg)
+            rows["Best*"] += unpack(allc[best], allc[best]["t"] >= ssv)
+            w = ss
+            while w < pd.Timestamp(end):
+                w_end = w + pd.Timedelta(days=182)
+                a0, a1, b1 = (w - pd.Timedelta(days=365)).value, w.value, w_end.value
+                stat_w, stat_r, stat_t = {}, {}, {}
+                for k, pk in allc.items():
+                    m = (pk["t"] >= a0) & (pk["t"] < a1)
+                    if m.sum() >= 30:
+                        stat_w[k], stat_r[k] = qstats(pk["r"][m])
+                    mt = m & pk["ok"]
+                    if mt.sum() >= 20:
+                        stat_t[k] = float(np.mean(pk["r"][mt]))
+                if stat_w:
+                    kw = max(stat_w, key=lambda k: stat_w[k])
+                    kr = max(stat_r, key=lambda k: stat_r[k])
+                    for name, k in (("WF-Win", kw), ("WF-R", kr)):
+                        pk = allc[k]
+                        rows[name] += unpack(pk, (pk["t"] >= a1) & (pk["t"] < b1))
+                    picks.append(f"{kr[0]}/{kr[1]:g}")
+                if stat_t:
+                    kt = max(stat_t, key=lambda k: stat_t[k])
+                    pk = allc[kt]
+                    rows["WF-R+Tr"] += unpack(pk, (pk["t"] >= a1) & (pk["t"] < b1) & pk["ok"])
+                w = w_end
+            log.info(f"{pair} | done | hindsight best P={best[0]} M={best[1]:g}")
+            del d, allc
+            gc.collect()
+        except Exception as e:
+            log.error(f"{pair} | BACKTEST ERROR | {e}")
+
+    log.info("")
+    log.info(f"===== VOLUME-DRIFT SUPERTREND | {TIMEFRAME} | scored {score_start:%Y} to {end:%Y} | results in R =====")
+    log.info(f"{'':<8}{'n':>5}{'win':>6}{'avgR':>6}{'PF':>5}{'1st':>6}{'2nd':>6}")
+    for name, tr in rows.items():
+        log.info(_summary_line(name, tr))
+    months = max(days / 30.4, 1)
+    for name in ("Default", "WF-R"):
+        tr = rows[name]
+        if tr:
+            log.info(f"{name}: avg stop {np.mean([x['risk_pips'] for x in tr]):.1f} pips, spread "
+                     f"{np.mean([x['spread_frac'] for x in tr]) * 100:.1f}% of risk, {len(tr) / months:.0f} trades/month")
+    log.info(f"WF-R picks (period/mult) per 6-month window: {', '.join(picks[:24])}")
+    log.info("Best* uses hindsight and cannot be traded - it shows how good an optimizer can make the past look.")
+    log.info("Pass: a WF row with avgR > 0 in BOTH halves, PF >= 1.2, a few hundred trades.")
+    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+
+
+# ----------------------------------------------------------------------------
 # LIVE
 # ----------------------------------------------------------------------------
 _NEWS = {"t": 0.0, "events": None}
@@ -3088,6 +3308,8 @@ def main():
             run_backtest_tsm(api, days)
         elif strategy == "scan":
             run_scan(api, days)
+        elif strategy == "sax":
+            run_backtest_sax(api, days)
         else:
             run_backtest(api, days)
         while True:  # idle so Railway does not keep re-running it
