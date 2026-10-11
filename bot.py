@@ -5,7 +5,7 @@ Signal : UT Bot style ATR trailing stop flip on M15, H1 or H4 (TIMEFRAME variabl
 Filters: ADX (no ranges), Bollinger squeeze, tick volume, higher-timeframe trend (EMA50/EMA200),
          daily support/resistance, spread vs risk
 Risk   : stop = 1.5 x ATR (STOP_MODE=atr) or the UT trailing-stop distance (STOP_MODE=ut), with a minimum size
-Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
+Modes  : backtest (default) | live (needs MODE=live AND LIVE_CONFIRM=yes; anything else stops the bot)
          BACKTEST_STRATEGY=srbb backtests your original bot instead (daily S/R + Bollinger bounce)
          BACKTEST_STRATEGY=flux backtests the two Flux Charts scripts (ICT Power Of Three, Volumized Order Blocks)
          BACKTEST_STRATEGY=po3s backtests the session Power Of Three (Asian range -> London fake move -> fade)
@@ -19,6 +19,7 @@ Modes  : live (default)  |  backtest  (UT baseline vs UT+ on OANDA history)
         BACKTEST_STRATEGY=po3v2 tests Power Of Three + trend filter + confirmation (break of structure, market entry)
         BACKTEST_STRATEGY=po3w wide test of PO3 + Echo (12 pairs, full history, + confirmation variants)
         BACKTEST_STRATEGY=tsm  daily trend-following (time-series momentum, 3/6/12-month lookbacks, 12 pairs)
+        BACKTEST_STRATEGY=compare compares UT fixed, UT flip and S/R Bollinger on the same history
         BACKTEST_STRATEGY=scan M15 signal scanner (10 timing/level signals, search 2014-2020, holdout 2020-today)
         BACKTEST_STRATEGY=sax  volume-drift SuperTrend (Swift Algo X style) + 144-combo walk-forward optimizer
         BACKTEST_STRATEGY=xgb  GainzAlgo XG Boost Lite reversals (rolling ML model) vs the same pivots without the model
@@ -36,12 +37,16 @@ Exits  : backtest compares "flip" (exit when UT Bot signals the other way) with 
          zone just before the next daily support/resistance level)
 
 Run:      python bot.py
-Backtest: set Railway variable MODE=backtest (optionally BACKTEST_DAYS=180 and
+Backtest: the default. MODE=backtest is still fine to set (optionally BACKTEST_DAYS=180 and
           BACKTEST_KEYS=1,2,3 and BACKTEST_ADX=0,15,20,25 to compare settings) and redeploy,
           or run: python bot.py backtest 180
           Test another timeframe with TIMEFRAME=H1 (or H4), e.g. BACKTEST_DAYS=365.
 """
 import logging
+import json
+import html
+from pathlib import Path
+import fcntl
 import gc
 import os
 import sys
@@ -78,6 +83,18 @@ PAIRS = [
 
 UNITS = _i("UNITS", 1000)                    # fixed size per trade (1000 = 0.01 lot)
 MAX_OPEN_TRADES = _i("MAX_OPEN_TRADES", 20)  # one trade per pair, this caps the total
+MAX_DAILY_LOSS_PCT = _f("MAX_DAILY_LOSS_PCT", 2.0)  # stop NEW entries at this equity drop vs UTC day's baseline; 0 disables
+MAX_PORTFOLIO_RISK_PCT = _f("MAX_PORTFOLIO_RISK_PCT", 3.0)  # sum loss from market price to protective stops; 0 disables
+BOT_STATE_FILE = os.getenv("BOT_STATE_FILE", "ut_bot_state.json")  # use a Railway volume for restart safety
+PERFORMANCE_REPORT_EVERY_CYCLES = _i("PERFORMANCE_REPORT_EVERY_CYCLES", 4)  # 0 disables reporting
+PERFORMANCE_REPORT_HTML = os.getenv("PERFORMANCE_REPORT_HTML", "performance_dashboard.html")
+PERFORMANCE_REPORT_CSV = os.getenv("PERFORMANCE_REPORT_CSV", "performance_trades.csv")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_PERFORMANCE_REPORTS = os.getenv("TELEGRAM_PERFORMANCE_REPORTS", "0") == "1"
+SLIPPAGE_PIPS_PER_SIDE = _f("SLIPPAGE_PIPS_PER_SIDE", 0.1)  # BACKTEST ONLY, stress-test assumption per entry/exit
+if min(MAX_DAILY_LOSS_PCT, MAX_PORTFOLIO_RISK_PCT, SLIPPAGE_PIPS_PER_SIDE) < 0:
+    raise RuntimeError("Loss, portfolio-risk and slippage settings cannot be negative")
 
 UT_KEY = _f("UT_KEY", 1.0)                   # UT Bot "key value" (sensitivity)
 UT_ATR = _i("UT_ATR", 10)                    # UT Bot ATR period
@@ -93,7 +110,7 @@ VOL_MIN_RATIO = _f("VOL_MIN_RATIO", 0.5)     # signal candle volume vs 20-bar av
 SR_BUFFER_R = _f("SR_BUFFER_R", 1.0)         # block if opposing daily level is within this many R
 MAX_SPREAD_RISK = _f("MAX_SPREAD_RISK", 0.25)  # skip if spread > this share of risk
 
-MAX_BARS_HELD = _i("MAX_BARS_HELD", 96)      # backtest only: close fixed-target trades after 24h
+MAX_BARS_HELD = _i("MAX_BARS_HELD", 0)       # fixed backtest: 0=hold until stop/TP (matches live); >0=research-only bar timeout
 FLIP_MAX_BARS = _i("FLIP_MAX_BARS", {"M15": 2880, "M30": 1440, "H1": 960, "H4": 240}.get(os.getenv("TIMEFRAME", "M15").upper(), 960))  # backtest only: ~30-40 days
 SR_TP_BUFFER_ATR = _f("SR_TP_BUFFER_ATR", 0.25)  # "sr" exit: take profit this many ATR before the level (the zone edge)
 SR_MIN_R = _f("SR_MIN_R", 1.0)               # "sr" exit: ignore levels closer than this many R
@@ -117,18 +134,67 @@ STOP_MODE = os.getenv("STOP_MODE", "atr").lower()    # "atr": stop = SL_ATR_MULT
 if STOP_MODE not in ("atr", "ut"):
     raise RuntimeError(f"STOP_MODE must be 'atr' or 'ut', got {STOP_MODE!r}")
 MANAGED_TAG = "utflip"
-RISK_PCT = _f("RISK_PCT", 0.5)               # % of balance risked per trade (0 = fixed UNITS instead)
+RISK_PCT = _f("RISK_PCT", 0.5)               # % of account NAV risked per trade (0 = fixed UNITS instead)
 MAX_UNITS = _i("MAX_UNITS", 50000)           # hard cap on trade size
 MAX_PER_CURRENCY = _i("MAX_PER_CURRENCY", 2) # max net same-direction trades per currency
 NEWS_FILTER = os.getenv("NEWS_FILTER", "1") == "1"
 NEWS_BLOCK_MIN = _i("NEWS_BLOCK_MIN", 30)    # no new trades this many minutes either side of high-impact news
-NEWS_FAIL_MODE = os.getenv("NEWS_FAIL_MODE", "allow").lower()  # if the feed is down: "allow" trading or "block" it
+NEWS_FAIL_MODE = os.getenv("NEWS_FAIL_MODE", "block").lower()  # if the feed is down: "block" trading (default) or "allow" it
 NEWS_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 NY_BLOCK = os.getenv("NY_BLOCK", "16:30-18:30")  # New York time window with no new trades ("" to turn off)                               # marks trades opened by this bot, so old/manual trades are never touched
 
 
+_HOME_CONV = {}  # refreshed from OANDA pricing.homeConversions each live cycle
+
 def pip(pair):
     return 0.01 if "JPY" in pair else 0.0001
+
+
+def _stop_r(direction, entry, risk, sl, bo_k, ao_k):
+    """R for a stop-out. If the candle OPENED beyond the stop (a gap), the fill is that open, not the stop price."""
+    px = min(sl, bo_k) if direction == 1 else max(sl, ao_k)
+    return float(direction * (px - entry) / risk)
+
+
+SWAP_PIPS = _f("SWAP_PIPS_PER_NIGHT", 0.5)       # backtest: estimated financing per night held, in pips (0 = off)
+_DAY_NS = 86_400_000_000_000
+_ROLL_NS = int(21.5 * 3600 * 1e9)                 # 17:00 New York is 21:00 or 22:00 UTC; 21:30 sits between
+
+
+def _nights(entry, exit_):
+    """Daily rollovers crossed between entry and exit (weekends count as calendar days, like OANDA charges)."""
+    a, b = pd.Timestamp(entry).value, pd.Timestamp(exit_).value
+    return max(0, (b - _ROLL_NS) // _DAY_NS - (a - _ROLL_NS) // _DAY_NS)
+
+
+def _apply_swap(obj):
+    """Charge the swap estimate on every trade record inside a simulator's result (once per trade)."""
+    if isinstance(obj, dict):
+        if "r" in obj and "risk_pips" in obj and "entry" in obj and "exit" in obj:
+            if not obj.get("_swapped"):
+                n = _nights(obj["entry"], obj["exit"])
+                if obj["risk_pips"] > 0:
+                    # Both sides of the round trip; no pretend perfect execution.
+                    obj["r"] = float(obj["r"]) - (n * SWAP_PIPS + 2 * SLIPPAGE_PIPS_PER_SIDE) / obj["risk_pips"]
+                obj["nights"] = n
+                obj["_swapped"] = True
+        else:
+            for v in obj.values():
+                if isinstance(v, (list, tuple)):
+                    _apply_swap(v)
+    elif isinstance(obj, (list, tuple)):
+        for x in obj:
+            if isinstance(x, (dict, list, tuple)):
+                _apply_swap(x)
+    return obj
+
+
+def _with_swap(fn):
+    def wrapped(*a, **k):
+        out = fn(*a, **k)
+        return _apply_swap(out) if SWAP_PIPS > 0 or SLIPPAGE_PIPS_PER_SIDE > 0 else out
+    wrapped.__name__ = fn.__name__
+    return wrapped
 
 
 def fmt_price(pair, p):
@@ -155,6 +221,10 @@ class Oanda:
                 "Missing OANDA token or account id. Set OANDA_API_KEY and OANDA_ACCOUNT_ID in Railway variables."
             )
         env = os.getenv("OANDA_ENV", "practice").lower()
+        if env not in ("practice", "live"):
+            raise RuntimeError("OANDA_ENV must be practice or live")
+        if env == "live" and os.getenv("REAL_MONEY_CONFIRM", "").strip().lower() != "yes":
+            raise RuntimeError("Real-money OANDA environment refused unless REAL_MONEY_CONFIRM=yes")
         self.base = (
             "https://api-fxtrade.oanda.com" if env == "live" else "https://api-fxpractice.oanda.com"
         )
@@ -263,9 +333,11 @@ def fetch_range(api, pair, gran, start):
     return out.drop_duplicates("time").sort_values("time").reset_index(drop=True)
 
 
-def get_prices(api):
+def get_prices(api, pairs=None):
+    # Also price manual/open positions, even when their pair is outside the bot's PAIRS.
     data = api.get(f"/v3/accounts/{api.account}/pricing",
-                   {"instruments": ",".join(PAIRS), "includeHomeConversions": "true"})
+                   {"instruments": ",".join(pairs or PAIRS), "includeHomeConversions": "true"})
+    _HOME_CONV.clear()  # never reuse potentially stale currency conversions
     for hc in data.get("homeConversions", []):
         try:
             _HOME_CONV[hc["currency"]] = float(hc["accountLoss"])
@@ -360,6 +432,10 @@ def add_htf_trend(d, htf_df):
     m["htf"] = m["htf"].fillna(0).astype(int)
     return m.reset_index(drop=True)
 
+
+COST_NOTE = (f"Costs: bid/ask spread on entry and exit, stops that gap fill at the candle open, swap estimate "
+             f"{SWAP_PIPS:g} pips per night held, assumed slippage {SLIPPAGE_PIPS_PER_SIDE:g} pips/side. "
+              "Not modelled: time-varying slippage, spread spikes, broker-specific financing or portfolio constraints.")
 
 _SR_CACHE = {}
 
@@ -485,7 +561,7 @@ def simulate(d, pair, daily, start_ts, use_filters, exit_mode="fixed", stop_mode
             for k in range(j, end + 1):
                 if direction == 1:  # long exits at the bid
                     if bl[k] <= sl:
-                        r = -1.0
+                        r = _stop_r(direction, entry, risk, sl, bo[k], ao[k])
                         break
                     if tp is not None and bh[k] >= tp:
                         r = (tp - entry) / risk
@@ -496,7 +572,7 @@ def simulate(d, pair, daily, start_ts, use_filters, exit_mode="fixed", stop_mode
                         break
                 else:  # short exits at the ask
                     if ah[k] >= sl:
-                        r = -1.0
+                        r = _stop_r(direction, entry, risk, sl, bo[k], ao[k])
                         break
                     if tp is not None and al[k] <= tp:
                         r = (entry - tp) / risk
@@ -507,18 +583,18 @@ def simulate(d, pair, daily, start_ts, use_filters, exit_mode="fixed", stop_mode
                         break
         else:
             tp = entry + direction * RR * risk
-            end = min(j + MAX_BARS_HELD, n - 1)
+            end = min(j + MAX_BARS_HELD, n - 1) if MAX_BARS_HELD > 0 else n - 1
             for k in range(j, end + 1):
                 if direction == 1:
                     if bl[k] <= sl:
-                        r = -1.0
+                        r = _stop_r(direction, entry, risk, sl, bo[k], ao[k])
                         break
                     if bh[k] >= tp:
                         r = RR
                         break
                 else:
                     if ah[k] >= sl:
-                        r = -1.0
+                        r = _stop_r(direction, entry, risk, sl, bo[k], ao[k])
                         break
                     if al[k] <= tp:
                         r = RR
@@ -529,7 +605,7 @@ def simulate(d, pair, daily, start_ts, use_filters, exit_mode="fixed", stop_mode
         # a flip exit happens on the signal candle, so that same signal may open the reverse trade
         busy = k - 1 if flipped else k
         exit_t = times[k + 1] if flipped else times[k]
-        trades.append({"pair": pair, "entry": times[j], "exit": exit_t, "dir": direction, "r": float(r)})
+        trades.append({"pair": pair, "entry": times[j], "exit": exit_t, "dir": direction, "r": float(r), "risk_pips": risk / pip(pair)})
     return trades, skipped
 
 
@@ -541,7 +617,9 @@ def stats(trades):
     gp = r[r > 0].sum()
     gl = -r[r < 0].sum()
     eq = np.cumsum(r)
-    dd = float((np.maximum.accumulate(eq) - eq).max())
+    # Include starting equity=0; otherwise an initial string of losses hides drawdown.
+    curve = np.r_[0.0, eq]
+    dd = float((np.maximum.accumulate(curve) - curve).max())
     return {
         "n": len(r),
         "win": 100.0 * (r > 0).mean(),
@@ -573,7 +651,7 @@ def run_backtest(api, days):
             raise RuntimeError(f"BACKTEST_STOPS values must be atr or ut, got {s!r}")
     show_sr = os.getenv("BACKTEST_SR", "0") == "1"      # the S/R take-profit exit is hidden unless BACKTEST_SR=1
     detail = os.getenv("BACKTEST_DETAIL", "1") != "0"   # BACKTEST_DETAIL=0 prints only the short summary table
-    modes = ("flip", "sr") if show_sr else ("flip",)
+    modes = ("fixed", "flip", "sr") if show_sr else ("fixed", "flip")
     single = len(keys) == 1 and len(adxs) == 1 and len(stops) == 1
     orig_adx = ADX_MIN
     log.info(
@@ -600,7 +678,7 @@ def run_backtest(api, days):
                         for mode in modes:
                             tr, sk = simulate(d, pair, dly, start_ts, True, mode, stop)
                             acc.setdefault((stop, key, adx, mode), []).extend(tr)
-                            if mode == "flip":
+                            if mode == EXIT_MODE:
                                 sa = skip_acc.setdefault((stop, key, adx), {})
                                 for k2, v in sk.items():
                                     sa[k2] = sa.get(k2, 0) + v
@@ -639,12 +717,12 @@ def run_backtest(api, days):
                     log.info("  blocked: " + (", ".join(f"{k2} {v}" for k2, v in top) or "none"))
 
     log.info("")
-    log.info("===== SUMMARY | flip exit | avgR = average R per trade =====")
+    log.info(f"===== SUMMARY | {EXIT_MODE} exit (matches live EXIT_MODE) | avgR = average R per trade =====")
     log.info(f"{'stop|key|adx':<11}{'n':>5}{'avgR':>6}{'PF':>5}{'1st':>6}{'2nd':>6}")
     for stop in stops:
         for key in keys:
             for adx in [None] + adxs:
-                tr = acc.get((stop, key, adx, "flip"), [])
+                tr = acc.get((stop, key, adx, EXIT_MODE), [])
                 s = stats(tr)
                 first, second = halves(tr)
                 label = f"{stop}|{key:g}|" + ("none" if adx is None else f"{adx:g}")
@@ -656,7 +734,7 @@ def run_backtest(api, days):
 
     if single:
         log.info("")
-        log.info(f"{'pair':<10}{'flip UT+ R':>13}{'flip UT+ n':>12}")
+        log.info(f"{'pair':<10}{(EXIT_MODE + ' UT+ R'):>13}{(EXIT_MODE + ' UT+ n'):>12}")
         for pair, row in per_pair.items():
             r = row.get((stops[0], keys[0], adxs[0]))
             if r:
@@ -664,8 +742,8 @@ def run_backtest(api, days):
 
     log.info("")
     log.info("Need: avgR above 0 in BOTH halves, PF above 1.2, a few hundred trades, and neighbouring settings that look similar.")
-    log.info("Backtests ignore slippage, swap fees and news gaps. Treat them as a sanity check, not a promise.")
-    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+    log.info(COST_NOTE)
+    log.info("Backtest finished. To go live: set MODE=live AND LIVE_CONFIRM=yes, then redeploy.")
 
 
 # ----------------------------------------------------------------------------
@@ -768,14 +846,14 @@ def simulate_srbb(d, pair, start_ts):
         for k in range(j, end + 1):
             if direction == 1:
                 if bl[k] <= sl:
-                    r = -1.0
+                    r = _stop_r(direction, entry, risk, sl, bo[k], ao[k])
                     break
                 if bh[k] >= tp:
                     r = SB_RR
                     break
             else:
                 if ah[k] >= sl:
-                    r = -1.0
+                    r = _stop_r(direction, entry, risk, sl, bo[k], ao[k])
                     break
                 if al[k] <= tp:
                     r = SB_RR
@@ -831,8 +909,9 @@ def run_backtest_srbb(api, days):
         log.info(f"{pair:<9}{s['n']:>5}{s['win']:>6.1f}%{s['total']:>8.1f}")
     log.info("")
     log.info(f"Break-even win rate at 1:{SB_RR:g} is {100.0 / (1.0 + SB_RR):.0f}%. Need avgR above 0 in BOTH halves and PF above 1.2.")
-    log.info("Not modelled: the old 5-trade cap and per-currency limit (this tests the signal itself), slippage, swap fees.")
-    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+    log.info("Not modelled: the old 5-trade cap and per-currency limit (this tests the signal itself).")
+    log.info(COST_NOTE)
+    log.info("Backtest finished. To go live: set MODE=live AND LIVE_CONFIRM=yes, then redeploy.")
 
 
 # ----------------------------------------------------------------------------
@@ -904,14 +983,14 @@ def simulate_po3(d, pair, start_ts, tr1=None, tr4=None):
         for k in range(j, end + 1):
             if direction == 1:
                 if bl[k] <= sl:
-                    r = -1.0
+                    r = _stop_r(direction, entry, risk, sl, bo[k], ao[k])
                     break
                 if bh[k] >= tp:
                     r = PO3_RR
                     break
             else:
                 if ah[k] >= sl:
-                    r = -1.0
+                    r = _stop_r(direction, entry, risk, sl, bo[k], ao[k])
                     break
                 if al[k] <= tp:
                     r = PO3_RR
@@ -959,12 +1038,12 @@ def simulate_ob(d, pair, start_ts):
             r = None
             if p["dir"] == 1:
                 if bl[i] <= p["sl"]:
-                    r = -1.0
+                    r = _stop_r(p["dir"], p["entry"], p["risk"], p["sl"], bo[i], ao[i])
                 elif bh[i] >= p["tp"]:
                     r = rr
             else:
                 if ah[i] >= p["sl"]:
-                    r = -1.0
+                    r = _stop_r(p["dir"], p["entry"], p["risk"], p["sl"], bo[i], ao[i])
                 elif al[i] <= p["tp"]:
                     r = rr
             if r is None and i - p["fill"] >= SB_MAX_BARS:
@@ -1112,8 +1191,8 @@ def run_backtest_flux(api, days):
                  f"{np.mean([x['spread_frac'] for x in first]) * 100:.0f}% of risk. "
                  f"Skipped (spread over {MAX_SPREAD_RISK * 100:.0f}% of risk): {ob_skip[OB_RRS[0]]}.")
     log.info("Need: avgR above 0 in BOTH halves, PF above 1.2, a few hundred trades.")
-    log.info("Not modelled: slippage, swap fees, news gaps.")
-    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+    log.info(COST_NOTE)
+    log.info("Backtest finished. To go live: set MODE=live AND LIVE_CONFIRM=yes, then redeploy.")
 
 
 # ----------------------------------------------------------------------------
@@ -1130,18 +1209,18 @@ PO3S_ASIA_END = 7 * 60      # minutes after midnight, London time
 PO3S_WINDOW_END = 10 * 60
 
 
-def _fixed_exit(direction, j, entry, sl, tp, rr, risk, bh, bl, bc, ah, al, ac, n):
+def _fixed_exit(direction, j, entry, sl, tp, rr, risk, bh, bl, bc, ah, al, ac, n, bo=None, ao=None):
     end = min(j + SB_MAX_BARS, n - 1)
     k = j
     for k in range(j, end + 1):
         if direction == 1:
             if bl[k] <= sl:
-                return -1.0, k
+                return (_stop_r(1, entry, risk, sl, bo[k], ao[k]) if bo is not None else -1.0), k
             if bh[k] >= tp:
                 return rr, k
         else:
             if ah[k] >= sl:
-                return -1.0, k
+                return (_stop_r(-1, entry, risk, sl, bo[k], ao[k]) if bo is not None else -1.0), k
             if al[k] <= tp:
                 return rr, k
     exit_p = bc[k] if direction == 1 else ac[k]
@@ -1204,7 +1283,7 @@ def simulate_po3_session(d, dly, pair, start_ts, need_sweep, follow=False):
         entry = ao[j] if direction == 1 else bo[j]
         risk = PO3_SL_ATR * atr[i]
         sl, tp = entry - direction * risk, entry + direction * PO3_RR * risk
-        r, k = _fixed_exit(direction, j, entry, sl, tp, PO3_RR, risk, bh, bl, bc, ah, al, ac, n)
+        r, k = _fixed_exit(direction, j, entry, sl, tp, PO3_RR, risk, bh, bl, bc, ah, al, ac, n, bo=bo, ao=ao)
         busy_until = k
         if t[j] >= start_ts:
             trades.append({"pair": pair, "entry": t[j], "exit": t[k], "dir": direction, "r": float(r),
@@ -1262,7 +1341,7 @@ def run_backtest_po3s(api, days):
                  f"{np.mean([x['spread_frac'] for x in sess]) * 100:.0f}% of risk.")
     log.info(f"Targets {PO3_RR:g}R per 1R risked, so it needs {100 / (1 + PO3_RR):.0f}%+ wins to break even.")
     log.info("Need: avgR above 0 in BOTH halves, PF above 1.2, a few hundred trades.")
-    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+    log.info("Backtest finished. To go live: set MODE=live AND LIVE_CONFIRM=yes, then redeploy.")
 
 
 # ----------------------------------------------------------------------------
@@ -1370,7 +1449,7 @@ def simulate_po3_combo(d, pair, start_ts, use_td, use_zone):
         entry = ao[j] if direction == 1 else bo[j]
         risk = PO3_SL_ATR * atr[signal_bar]
         sl, tp = entry - direction * risk, entry + direction * PO3_RR * risk
-        r, k = _fixed_exit(direction, j, entry, sl, tp, PO3_RR, risk, bh, bl, bc, ah, al, ac, n)
+        r, k = _fixed_exit(direction, j, entry, sl, tp, PO3_RR, risk, bh, bl, bc, ah, al, ac, n, bo=bo, ao=ao)
         if t[j] >= start_ts:
             trades.append({"pair": pair, "entry": t[j], "exit": t[k], "dir": direction, "r": float(r),
                            "risk_pips": risk / pip(pair), "spread_frac": (ao[j] - bo[j]) / risk})
@@ -1414,7 +1493,7 @@ def run_backtest_po3c(api, days):
     log.info(f"All 3 skipped setups: no TD exhaustion {rej['td']}, no tight zone {rej['zone']}.")
     log.info(f"Targets {PO3_RR:g}R per 1R risked, so it needs {100 / (1 + PO3_RR):.0f}%+ wins to break even.")
     log.info("Need: avgR above 0 in BOTH halves, PF above 1.2, a few hundred trades.")
-    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+    log.info("Backtest finished. To go live: set MODE=live AND LIVE_CONFIRM=yes, then redeploy.")
 
 
 # ----------------------------------------------------------------------------
@@ -1537,7 +1616,7 @@ def simulate_po3_echo(d, pair, start_ts, use_echo, use_bos):
         entry = ao[j] if direction == 1 else bo[j]
         risk = PO3_SL_ATR * atr[signal_bar]
         sl, tp = entry - direction * risk, entry + direction * PO3_RR * risk
-        r, k = _fixed_exit(direction, j, entry, sl, tp, PO3_RR, risk, bh, bl, bc, ah, al, ac, n)
+        r, k = _fixed_exit(direction, j, entry, sl, tp, PO3_RR, risk, bh, bl, bc, ah, al, ac, n, bo=bo, ao=ao)
         if t[j] >= start_ts:
             trades.append({"pair": pair, "entry": t[j], "exit": t[k], "dir": direction, "r": float(r),
                            "risk_pips": risk / pip(pair), "spread_frac": (ao[j] - bo[j]) / risk})
@@ -1576,7 +1655,7 @@ def run_backtest_po3e(api, days):
     log.info(f"Setups skipped because Echo disagreed: {rej['echo']}.")
     log.info(f"Targets {PO3_RR:g}R per 1R risked, so it needs {100 / (1 + PO3_RR):.0f}%+ wins to break even.")
     log.info("Need: avgR above 0 in BOTH halves, PF above 1.2, a few hundred trades.")
-    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+    log.info("Backtest finished. To go live: set MODE=live AND LIVE_CONFIRM=yes, then redeploy.")
 
 
 # ----------------------------------------------------------------------------
@@ -1616,7 +1695,7 @@ def run_backtest_lbo(api, days):
     for pair, s in per_pair:
         log.info(f"{pair:<9}{s['n']:>5}{s['total']:>8.1f}")
     log.info(f"Targets {PO3_RR:g}R per 1R risked, so it needs {100 / (1 + PO3_RR):.0f}%+ wins to break even.")
-    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+    log.info("Backtest finished. To go live: set MODE=live AND LIVE_CONFIRM=yes, then redeploy.")
 
 
 # ----------------------------------------------------------------------------
@@ -1695,7 +1774,7 @@ def simulate_po3x(d, pair, start_ts, end_ts, struct_stop, range_target):
             i += 1
             continue
         rr = reward / risk
-        r, k = _fixed_exit(direction, j, entry, sl, tp, rr, risk, bh, bl, bc, ah, al, ac, n)
+        r, k = _fixed_exit(direction, j, entry, sl, tp, rr, risk, bh, bl, bc, ah, al, ac, n, bo=bo, ao=ao)
         if start_ts <= t[j] < end_ts:
             trades.append({"pair": pair, "entry": t[j], "exit": t[k], "dir": direction, "r": float(r),
                            "rr": rr, "risk_pips": risk / pip(pair), "spread_frac": (ao[j] - bo[j]) / risk})
@@ -1734,7 +1813,7 @@ def run_backtest_po3x(api, days):
             log.info(f"{name}: average target {np.mean([x['rr'] for x in tr]):.2f}R, stop "
                      f"{np.mean([x['risk_pips'] for x in tr]):.0f} pips, spread {np.mean([x['spread_frac'] for x in tr]) * 100:.1f}% of risk")
     log.info("Compare PF (avgR is per each version's own stop size). Need avgR above 0 in BOTH halves and PF above 1.2.")
-    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+    log.info("Backtest finished. To go live: set MODE=live AND LIVE_CONFIRM=yes, then redeploy.")
 
 
 # ----------------------------------------------------------------------------
@@ -1838,12 +1917,12 @@ def simulate_smc(d, pair, start_ts, end_ts, ctx, rr, use_level, entry_mode="limi
             r = None
             if pos["dir"] == 1:
                 if bl[i] <= pos["sl"]:
-                    r = -1.0
+                    r = _stop_r(pos["dir"], pos["entry"], pos["risk"], pos["sl"], bo[i], ao[i])
                 elif bh[i] >= pos["tp"]:
                     r = rr
             else:
                 if ah[i] >= pos["sl"]:
-                    r = -1.0
+                    r = _stop_r(pos["dir"], pos["entry"], pos["risk"], pos["sl"], bo[i], ao[i])
                 elif al[i] <= pos["tp"]:
                     r = rr
             if r is None and i - pos["fill"] >= SB_MAX_BARS:
@@ -2025,7 +2104,7 @@ def run_backtest_smc(api, days):
     sk = skips["1:3 +Lvl"]
     log.info("Setups not taken (1:3 +Lvl): " + (", ".join(f"{k2} {v}" for k2, v in sk.items() if v) or "none"))
     log.info("Need: avgR above 0 in BOTH halves, PF above 1.2, a few hundred trades.")
-    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+    log.info("Backtest finished. To go live: set MODE=live AND LIVE_CONFIRM=yes, then redeploy.")
 
 
 # ----------------------------------------------------------------------------
@@ -2085,7 +2164,7 @@ def run_backtest_smce(api, days):
         sk = skips[f"{mode} 1:3"]
         log.info(f"{mode} setups not taken: " + (", ".join(f"{k2} {v}" for k2, v in sk.items() if v) or "none"))
     log.info("Pass: Market or Confirm beats Limit AND avgR > 0 in BOTH halves, PF >= 1.2.")
-    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+    log.info("Backtest finished. To go live: set MODE=live AND LIVE_CONFIRM=yes, then redeploy.")
 
 
 # ----------------------------------------------------------------------------
@@ -2135,12 +2214,12 @@ def simulate_combo(d, pair, start_ts, end_ts, ctx, rr, entry_mode="limit"):
             r = None
             if pos["dir"] == 1:
                 if bl[i] <= pos["sl"]:
-                    r = -1.0
+                    r = _stop_r(pos["dir"], pos["entry"], pos["risk"], pos["sl"], bo[i], ao[i])
                 elif bh[i] >= pos["tp"]:
                     r = rr
             else:
                 if ah[i] >= pos["sl"]:
-                    r = -1.0
+                    r = _stop_r(pos["dir"], pos["entry"], pos["risk"], pos["sl"], bo[i], ao[i])
                 elif al[i] <= pos["tp"]:
                     r = rr
             if r is None and i - pos["fill"] >= SB_MAX_BARS:
@@ -2294,7 +2373,7 @@ def run_backtest_combo(api, days):
         log.info(f"Combo 1:3: average stop {np.mean([x['risk_pips'] for x in base]):.1f} pips, spread "
                  f"{np.mean([x['spread_frac'] for x in base]) * 100:.1f}% of risk, about {len(base) / max(days / 30.4, 1):.1f} trades a month")
     log.info("Need: avgR above 0 in BOTH halves, PF above 1.2, a few hundred trades.")
-    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+    log.info("Backtest finished. To go live: set MODE=live AND LIVE_CONFIRM=yes, then redeploy.")
 
 
 # ----------------------------------------------------------------------------
@@ -2350,7 +2429,7 @@ def run_backtest_po3v2(api, days):
                      f"{np.mean([x['spread_frac'] for x in tr]) * 100:.1f}% of risk, {len(tr) / months:.1f} trades/month")
     log.info("Conf setups: " + ", ".join(f"{k2} {v}" for k2, v in counts.items()))
     log.info("Pass: avgR > 0 in BOTH halves, PF >= 1.2, a few hundred trades. Then confirm on untouched data.")
-    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+    log.info("Backtest finished. To go live: set MODE=live AND LIVE_CONFIRM=yes, then redeploy.")
 
 
 # ----------------------------------------------------------------------------
@@ -2435,7 +2514,7 @@ def simulate_po3_echo_conf(d, pair, start_ts, end_ts, rr):
             i = j
             continue
         tp = entry + direction * rr * risk
-        r, k = _fixed_exit(direction, j, entry, sl, tp, rr, risk, bh, bl, bc, ah, al, ac, n)
+        r, k = _fixed_exit(direction, j, entry, sl, tp, rr, risk, bh, bl, bc, ah, al, ac, n, bo=bo, ao=ao)
         if start_ts <= t[j] < end_ts:
             trades.append({"pair": pair, "entry": t[j], "exit": t[k], "dir": direction, "r": float(r),
                            "risk_pips": risk / pip(pair), "spread_frac": (ao[j] - bo[j]) / risk})
@@ -2493,7 +2572,7 @@ def run_backtest_po3w(api, days):
         log.info(f"{name} by pair: " + ", ".join(f"{k} {np.mean(v):+.2f} ({len(v)})" for k, v in per.items()))
     log.info("Conf setups: " + ", ".join(f"{k2} {v}" for k2, v in counts.items()))
     log.info("Pass: avgR > 0 in BOTH halves, PF >= 1.2, 300+ trades, most pairs positive.")
-    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+    log.info("Backtest finished. To go live: set MODE=live AND LIVE_CONFIRM=yes, then redeploy.")
 
 
 # ----------------------------------------------------------------------------
@@ -2503,7 +2582,7 @@ def run_backtest_po3w(api, days):
 #   close it and reverse at the next day's open (real bid/ask, so spread is paid). Always in the market.
 #   No stop and no target: trades end only when the trend signal flips.
 #   1R = 3 x daily ATR(20) at entry (a size unit so results compare with the other tests).
-#   Lookbacks: 60 / 120 / 250 days (about 3, 6, 12 months). Overnight financing (swap) is NOT included.
+#   Lookbacks: 60 / 120 / 250 days (about 3, 6, 12 months). Overnight financing: SWAP_PIPS_PER_NIGHT estimate.
 #   Pass: avgR > 0 in BOTH halves, PF >= 1.2, 300+ trades, most pairs positive, neighbouring lookbacks agree.
 # ----------------------------------------------------------------------------
 TSM_LOOKBACKS = [int(x) for x in os.getenv("TSM_LOOKBACKS", "60,120,250").split(",") if x.strip()]
@@ -2586,9 +2665,10 @@ def run_backtest_tsm(api, days):
         per.setdefault(x["pair"], []).append(x["r"])
     log.info("TS120 by pair (total R): " + ", ".join(f"{k} {np.sum(v):+.0f}" for k, v in per.items()))
     log.info("Win rate is low by design: trend-following loses small and often, wins big and rarely.")
-    log.info("Swap/financing not included. Pass: avgR > 0 in BOTH halves, PF >= 1.2, 300+ trades, most pairs "
+    log.info(COST_NOTE)
+    log.info("Pass: avgR > 0 in BOTH halves, PF >= 1.2, 300+ trades, most pairs "
              "positive, lookbacks agree.")
-    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+    log.info("Backtest finished. To go live: set MODE=live AND LIVE_CONFIRM=yes, then redeploy.")
 
 
 # ----------------------------------------------------------------------------
@@ -2696,12 +2776,12 @@ def scan_simulate(d, pair, entries, mod, datr, rr, flip):
                 break
             if dirn == 1:
                 if bl[k] <= sl:
-                    r = -1.0; break
+                    r = _stop_r(dirn, entry, risk, sl, bo[k], ao[k]); break
                 if bh[k] >= tp:
                     r = rr; break
             else:
                 if ah[k] >= sl:
-                    r = -1.0; break
+                    r = _stop_r(dirn, entry, risk, sl, bo[k], ao[k]); break
                 if al[k] <= tp:
                     r = rr; break
             if mod[k] == SCAN_EXIT_MOD:                           # the exit candle: close at its close
@@ -2798,7 +2878,7 @@ def run_scan(api, days):
                  f"{np.mean([x['exit_spread'] for x in allr if x['timed']] or [0]) * 100:.1f}% of risk | "
                  f"{np.mean([x['timed'] for x in allr]) * 100:.0f}% of trades closed by the time exit")
     log.info("A signal counts only if it passes SEARCH and then HOLDOUT. Then it goes to the demo account first.")
-    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+    log.info("Backtest finished. To go live: set MODE=live AND LIVE_CONFIRM=yes, then redeploy.")
 
 
 # ----------------------------------------------------------------------------
@@ -2979,7 +3059,7 @@ def run_backtest_sax(api, days):
                 a0, a1, b1 = (w - pd.Timedelta(days=365)).value, w.value, w_end.value
                 stat_w, stat_r, stat_t = {}, {}, {}
                 for k, pk in allc.items():
-                    m = (pk["t"] >= a0) & (pk["t"] < a1)
+                    m = (pk["t"] >= a0) & (pk["x"] < a1)   # closed before the decision
                     if m.sum() >= 30:
                         stat_w[k], stat_r[k] = qstats(pk["r"][m])
                     mt = m & pk["ok"]
@@ -3017,7 +3097,7 @@ def run_backtest_sax(api, days):
     log.info(f"WF-R picks (period/mult) per 6-month window: {', '.join(picks[:24])}")
     log.info("Best* uses hindsight and cannot be traded - it shows how good an optimizer can make the past look.")
     log.info("Pass: a WF row with avgR > 0 in BOTH halves, PF >= 1.2, a few hundred trades.")
-    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+    log.info("Backtest finished. To go live: set MODE=live AND LIVE_CONFIRM=yes, then redeploy.")
 
 
 # ----------------------------------------------------------------------------
@@ -3146,9 +3226,7 @@ def simulate_xgb(d, pair, start_ts, end_ts, use_model, mode):
             lo_, hi_ = (bl[k], bh[k]) if dirn == 1 else (al[k], ah[k])
             stop_hit = lo_ <= sl if dirn == 1 else hi_ >= sl
             if stop_hit:
-                r = 0.0 if be else -1.0
-                if be:
-                    r = dirn * (sl - entry) / risk
+                r = _stop_r(dirn, entry, risk, sl, bo[k], ao[k])   # break-even stop included; gaps fill at the open
                 break
             tgt_hit = hi_ >= tp if dirn == 1 else lo_ <= tp
             if tgt_hit:
@@ -3206,7 +3284,7 @@ def run_backtest_xgb(api, days):
             log.info(f"{name}: avg stop {np.mean([x['risk_pips'] for x in tr]):.1f} pips, spread "
                      f"{np.mean([x['spread_frac'] for x in tr]) * 100:.1f}% of risk, {len(tr) / months:.1f} trades/month")
     log.info("Pass: an ML row with avgR > 0 in BOTH halves, PF >= 1.2, a few hundred trades, AND better than Raw.")
-    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+    log.info("Backtest finished. To go live: set MODE=live AND LIVE_CONFIRM=yes, then redeploy.")
 
 
 # ----------------------------------------------------------------------------
@@ -3304,7 +3382,7 @@ def simulate_po3_tools(d, pair, start_ts, end_ts, variant):
             continue
         sl = entry - direction * risk
         tp = entry + direction * rr * risk
-        r, k = _fixed_exit(direction, j, entry, sl, tp, rr, risk, bh, bl, bc, ah, al, ac, n)
+        r, k = _fixed_exit(direction, j, entry, sl, tp, rr, risk, bh, bl, bc, ah, al, ac, n, bo=bo, ao=ao)
         if start_ts <= t[j] < end_ts:
             trades.append({"pair": pair, "entry": t[j], "exit": t[k], "dir": direction, "r": float(r), "rr": rr,
                            "risk_pips": risk / pip(pair), "spread_frac": (ao[j] - bo[j]) / risk})
@@ -3352,7 +3430,7 @@ def run_backtest_po3tools(api, days):
         log.info(f"{name}: coin flip {cf:.0f}% | {pos} of {len(per)} pairs positive | avg stop "
                  f"{np.mean([x['risk_pips'] for x in tr]):.1f} pips | spread {np.mean([x['spread_frac'] for x in tr]) * 100:.1f}% of risk")
     log.info("Pass: avgR > 0 in BOTH halves, PF >= 1.2, 300+ trades, most pairs positive - and better than Base.")
-    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+    log.info("Backtest finished. To go live: set MODE=live AND LIVE_CONFIRM=yes, then redeploy.")
 
 
 # ----------------------------------------------------------------------------
@@ -3374,7 +3452,7 @@ BRK_PAIRS = [p.strip().upper() for p in os.getenv(
     "BRK_PAIRS", "EUR_USD,GBP_USD,USD_JPY,AUD_USD,USD_CAD,EUR_JPY").split(",") if p.strip()]
 
 
-def _partial_exit(dirn, j, entry, risk, rrs, wts, bh, bl, bc, ah, al, ac, n):
+def _partial_exit(dirn, j, entry, risk, rrs, wts, bh, bl, bc, ah, al, ac, n, bo=None, ao=None):
     sl = entry - dirn * risk
     tps = [entry + dirn * rr * risk for rr in rrs]
     open_legs = list(range(len(rrs)))
@@ -3384,7 +3462,8 @@ def _partial_exit(dirn, j, entry, risk, rrs, wts, bh, bl, bc, ah, al, ac, n):
     for k in range(j, end + 1):
         lo_, hi_ = (bl[k], bh[k]) if dirn == 1 else (al[k], ah[k])
         if (dirn == 1 and lo_ <= sl) or (dirn == -1 and hi_ >= sl):
-            r += sum(-wts[g] for g in open_legs)          # stop first if both touched in one candle
+            sr = _stop_r(dirn, entry, risk, sl, bo[k], ao[k]) if bo is not None else -1.0
+            r += sum(wts[g] * sr for g in open_legs)     # stop first if both touched in one candle
             return r, k
         for g in list(open_legs):
             if (dirn == 1 and hi_ >= tps[g]) or (dirn == -1 and lo_ <= tps[g]):
@@ -3435,7 +3514,7 @@ def simulate_breakout(d, pair, start_ts, end_ts, variant):
         j = i + 1
         entry = ao[j] if dirn == 1 else bo[j]
         risk = stop_mult * atr[i]
-        r, k = _partial_exit(dirn, j, entry, risk, rrs, wts, bh, bl, bc, ah, al, ac, n)
+        r, k = _partial_exit(dirn, j, entry, risk, rrs, wts, bh, bl, bc, ah, al, ac, n, bo=bo, ao=ao)
         if start_ts <= t[j] < end_ts:
             trades.append({"pair": pair, "entry": t[j], "exit": t[k], "dir": dirn, "r": float(r),
                            "risk_pips": risk / pip(pair), "spread_frac": (ao[j] - bo[j]) / risk})
@@ -3484,7 +3563,7 @@ def run_backtest_breakout(api, days):
                  f"spread {np.mean([x['spread_frac'] for x in tr]) * 100:.1f}% of risk | {len(tr) / months:.0f} trades/month")
     log.info("Script/Overlap/Wide/All use 3 partial targets: judge them by avgR and PF, not win rate. 1:2 coin flip = 33%.")
     log.info("Pass: avgR > 0 in BOTH halves, PF >= 1.2, 300+ trades, most pairs positive. Then confirm on untouched years.")
-    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+    log.info("Backtest finished. To go live: set MODE=live AND LIVE_CONFIRM=yes, then redeploy.")
 
 
 # ----------------------------------------------------------------------------
@@ -3597,12 +3676,12 @@ def run_news(api, days):
                         while k < n and mod[k] < 720 and (k == j or mod[k] >= mod[j]):
                             if dirn == 1:
                                 if bl[k] <= sl:
-                                    r = -1.0; break
+                                    r = _stop_r(dirn, entry, risk, sl, bo[k], ao[k]); break
                                 if bh[k] >= tp:
                                     r = rr; break
                             else:
                                 if ah[k] >= sl:
-                                    r = -1.0; break
+                                    r = _stop_r(dirn, entry, risk, sl, bo[k], ao[k]); break
                                 if al[k] <= tp:
                                     r = rr; break
                             k += 1
@@ -3651,13 +3730,298 @@ def run_news(api, days):
         log.info(f"Avg stop {np.mean([x['risk_pips'] for x in allr]):.1f} pips | spread at the 08:45 entry "
                  f"{np.mean([x['spread_frac'] for x in allr]) * 100:.1f}% of risk")
     log.info("A row counts only if it passes SEARCH and then HOLDOUT. Then it goes to the demo account first.")
-    log.info("Backtest finished. Remove the MODE variable (or set MODE=live) and redeploy to go live.")
+    log.info("Backtest finished. To go live: set MODE=live AND LIVE_CONFIRM=yes, then redeploy.")
 
 
 # ----------------------------------------------------------------------------
 # LIVE
 # ----------------------------------------------------------------------------
-_NEWS = {"t": 0.0, "events": None}
+_NEWS = {"t": 0.0, "events": None, "ok_t": 0.0}
+
+# ----------------------------------------------------------------------------
+# DEMO SAFETY, SIGNAL DEDUPLICATION AND PHONE REPORTING
+# ----------------------------------------------------------------------------
+_STATE = None
+_INSTANCE_LOCK = None
+
+
+def send_alert(message):
+    """Optional Telegram mobile push. Never log Telegram token/chat ID."""
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": message[:3500]}, timeout=10,
+        )
+        response.raise_for_status()
+    except requests.RequestException as e:
+        # Avoid leaking Telegram credentials in exception URL strings.
+        log.warning(f"TELEGRAM ALERT FAILED | {type(e).__name__}")
+
+
+def _state_save():
+    """Atomically persist risk baseline and used signals (configure a Railway volume)."""
+    dest = Path(BOT_STATE_FILE)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + f".{os.getpid()}.tmp")
+    try:
+        with tmp.open("w", encoding="utf8") as f:
+            json.dump(_STATE, f, sort_keys=True)
+        os.replace(tmp, dest)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def _state_load():
+    global _STATE
+    if _STATE is None:
+        path = Path(BOT_STATE_FILE)
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf8"))
+            if not isinstance(data, dict) or not isinstance(data.get("signals", {}), dict):
+                raise RuntimeError("invalid bot state; blocking new entries")
+            _STATE = data
+        else:
+            _STATE = {"signals": {}}
+            _state_save()  # if not writable, fail closed instead of trading without safety state
+    return _STATE
+
+
+def _single_instance_lock():
+    """Prevent two bot processes with the SAME filesystem from placing duplicate orders."""
+    global _INSTANCE_LOCK
+    lockfile = Path(BOT_STATE_FILE + ".lock")
+    lockfile.parent.mkdir(parents=True, exist_ok=True)
+    _INSTANCE_LOCK = lockfile.open("a+")
+    try:
+        fcntl.flock(_INSTANCE_LOCK.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        raise RuntimeError("another bot is already running against this state file") from exc
+
+
+def daily_entry_gate(account, now=None):
+    """UTC daily NAV baseline. Existing trades are NEVER closed by this gate."""
+    now = now or datetime.now(timezone.utc)
+    state = _state_load()
+    day = now.astimezone(timezone.utc).strftime("%Y-%m-%d")
+    nav = float(account["NAV"])
+    if not np.isfinite(nav) or nav <= 0:
+        raise RuntimeError("invalid NAV; trading blocked")
+    if state.get("day") != day:
+        state["day"] = day
+        state["starting_nav"] = nav
+        # Keep recent signal IDs across midnight so restarting cannot re-use a candle.
+        state["signals"] = {k: v for k, v in state.get("signals", {}).items()
+                            if isinstance(v, str) and v >= (now - timedelta(days=3)).isoformat()}
+        state["last_daily_alert_day"] = ""
+        _state_save()
+        log.info(f"DAILY GUARD | new UTC day {day}; opening NAV snapshot {nav:.2f} {account['currency']}")
+    baseline = float(state.get("starting_nav", 0))
+    if baseline <= 0 or not np.isfinite(baseline):
+        raise RuntimeError("invalid daily NAV baseline; trading blocked")
+    drawdown = max(0., 100 * (baseline - nav) / baseline)
+    if MAX_DAILY_LOSS_PCT > 0 and drawdown >= MAX_DAILY_LOSS_PCT:
+        if state.get("last_daily_alert_day") != day:
+            send_alert(f"OANDA bot: DAILY LOSS LIMIT reached: {drawdown:.2f}% vs {MAX_DAILY_LOSS_PCT:.2f}% UTC-day limit. New entries stopped; existing stops/exits remain active.")
+            state["last_daily_alert_day"] = day
+            _state_save()
+        return False, f"daily NAV loss {drawdown:.2f}% >= limit {MAX_DAILY_LOSS_PCT:.2f}%"
+    return True, f"daily NAV drawdown {drawdown:.2f}% / {MAX_DAILY_LOSS_PCT:g}% limit"
+
+
+def claim_signal(pair, candle_close):
+    """Reserve a signal BEFORE POST. Ambiguous HTTP failures are never auto-retried."""
+    state = _state_load()
+    key = f"{pair}:{pd.Timestamp(candle_close).isoformat()}"
+    if key in state["signals"]:
+        return None
+    state["signals"][key] = datetime.now(timezone.utc).isoformat()
+    _state_save()
+    # OANDA client IDs consist of a short deterministic string with safe characters.
+    compact = pd.Timestamp(candle_close).strftime("%Y%m%d%H%M")
+    return f"ut-{TIMEFRAME.lower()}-{pair.lower().replace('_', '')}-{compact}"
+
+
+def open_portfolio_risk(trades, prices, account):
+    """Estimate prospective market-to-stop losses for ALL open trades, in account currency.
+
+    Fail closed for new entries if any trade lacks a protective stop, market price,
+    or required conversion. This includes manually placed account trades.
+    """
+    total = 0.0
+    currency = account["currency"]
+    for t in trades:
+        pair = t["instrument"]
+        stop = t.get("stopLossOrder") or t.get("guaranteedStopLossOrder")
+        if not stop or "price" not in stop:
+            raise RuntimeError(f"{pair} trade {t.get('id')} has no stop loss")
+        if pair not in prices:
+            raise RuntimeError(f"{pair}: no current price to measure portfolio risk")
+        units = float(t["currentUnits"])
+        if units == 0:
+            continue
+        direction = 1 if units > 0 else -1
+        bid, ask = prices[pair]
+        current_exit = bid if direction > 0 else ask
+        distance = max(0., direction * (current_exit - float(stop["price"])))
+        total += distance * abs(units) * quote_to_account(pair, currency)
+    return total
+
+
+def mark_notified_close(trade_id):
+    """Prevent double Telegram messages after a flip exit we already announced."""
+    state = _state_load()
+    if isinstance(state.get("known_closed_trades"), dict):
+        state["known_closed_trades"][str(trade_id)] = datetime.now(timezone.utc).isoformat()
+        _state_save()
+
+
+def notify_recent_closes(api):
+    """Notify fixed-stop/target exits as well as flips; seed silently on first run.
+
+    Only checks the latest 100 account closes. This is best-effort, not an audit log.
+    """
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return
+    data = api.get(f"/v3/accounts/{api.account}/trades", {"state": "CLOSED", "count": 100})
+    records = [t for t in data.get("trades", [])
+               if (t.get("clientExtensions") or {}).get("tag") == MANAGED_TAG]
+    state = _state_load()
+    current = {str(t["id"]): str(t.get("closeTime", "")) for t in records}
+    prev = state.get("known_closed_trades")
+    if prev is not None:
+        for t in sorted(records, key=lambda tr: tr.get("closeTime", "")):
+            if str(t["id"]) not in prev:
+                send_alert(f"OANDA bot: {t.get('instrument', '?')} CLOSED | "
+                           f"trade {t['id']} | realized P/L {t.get('realizedPL', '?')}")
+    state["known_closed_trades"] = current
+    _state_save()
+
+
+def _report_metrics(records):
+    vals = [float(t.get("realizedPL", 0)) for t in records]
+    pos = sum(x for x in vals if x > 0)
+    neg = -sum(x for x in vals if x < 0)
+    equity = 0.0
+    peak = 0.0
+    worst = 0.0
+    for value in vals:
+        equity += value
+        peak = max(peak, equity)
+        worst = max(worst, peak - equity)
+    return {"count": len(vals), "wins": sum(x > 0 for x in vals),
+            "net": sum(vals), "pf": pos / neg if neg > 0 else None, "maxdd": worst}
+
+
+def report_performance(api, account):
+    """Latest (up to 500) closed bot trades, as actual broker-reported realized P/L.
+
+    Writes local HTML + CSV, and a readable text summary to Railway logs.
+    This is a rolling sample, not a complete lifetime statement, and realizedPL
+    may not include all financing/fees; use OANDA statements for accounting.
+    """
+    j = api.get(f"/v3/accounts/{api.account}/trades", {"state": "CLOSED", "count": 500})
+    all_trades = j.get("trades", [])
+    records = [t for t in all_trades if (t.get("clientExtensions") or {}).get("tag") == MANAGED_TAG]
+    records.sort(key=lambda t: t.get("closeTime", ""))
+    now = datetime.now(timezone.utc)
+    recent = [t for t in records if pd.to_datetime(t.get("closeTime"), utc=True) >=
+              pd.Timestamp(now - timedelta(days=30))]
+    metrics = _report_metrics(recent)
+    pf = f"{metrics['pf']:.2f}" if metrics["pf"] is not None else "n/a"
+    winrate = 100 * metrics['wins'] / metrics['count'] if metrics['count'] else 0
+    log.info(f"PERFORMANCE | last 30d (up to 500 recent closed trades) | {metrics['count']} trades | "
+             f"win {winrate:.1f}% | realized {metrics['net']:+.2f} {account['currency']} | "
+             f"PF {pf} | closed-trade drawdown {metrics['maxdd']:.2f}")
+    if TELEGRAM_PERFORMANCE_REPORTS:
+        send_alert(f"OANDA bot | rolling last 30 days: {metrics['count']} closed trades, "
+                   f"win rate {winrate:.1f}%, P/L {metrics['net']:+.2f} {account['currency']}, "
+                   f"profit factor {pf}, closed-trade drawdown {metrics['maxdd']:.2f}. "
+                   "Latest 500 account trades queried; excludes some financing/fees.")
+    by_pair = {}
+    for record in recent:
+        by_pair.setdefault(record.get('instrument', '?'), []).append(record)
+    for pair, subset in sorted(by_pair.items()):
+        m = _report_metrics(subset)
+        log.info(f"PERFORMANCE PAIR | {pair} | {m['count']} trades | realized {m['net']:+.2f} {account['currency']}")
+
+    import csv
+    csvfile = Path(PERFORMANCE_REPORT_CSV)
+    htmlfile = Path(PERFORMANCE_REPORT_HTML)
+    for path in (csvfile, htmlfile):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    with csvfile.open('w', newline='', encoding='utf8') as file:
+        writer = csv.writer(file)
+        writer.writerow(["trade_id", "pair", "opened_utc", "closed_utc", "units", "realizedPL_account_currency"])
+        for r in records:
+            writer.writerow([r.get("id"), r.get("instrument"), r.get("openTime"), r.get("closeTime"),
+                             r.get("initialUnits"), r.get("realizedPL")])
+
+    rows = "".join(f"<tr><td>{html.escape(pair)}</td><td>{_report_metrics(subset)['count']}</td>"
+                   f"<td>{_report_metrics(subset)['net']:+.2f}</td></tr>"
+                   for pair, subset in sorted(by_pair.items()))
+    report_html = f"""<!doctype html><html lang="en"><meta charset="utf-8">
+<title>UT Bot — Demo Performance</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{{font:16px system-ui;max-width:840px;margin:35px auto;padding:20px;color:#172334;background:#f7f9fb}}
+header,section{{background:white;border-radius:14px;padding:22px;margin-bottom:16px;box-shadow:0 2px 12px #0001}}
+.stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px}}
+.stats div{{background:#eff4f8;padding:16px;border-radius:10px}}strong{{display:block;font-size:1.6rem}}
+table{{border-collapse:collapse;width:100%}}th,td{{text-align:left;padding:12px;border-bottom:1px solid #ddd}}</style>
+<header><h1>UT+ Demo Performance</h1><p>Last 30 days | OANDA closed bot trades | Generated {now:%Y-%m-%d %H:%M} UTC</p>
+<p>Account currency: {html.escape(account['currency'])}</p></header>
+<section class="stats"><div><strong>{metrics['count']}</strong>Closed trades</div>
+<div><strong>{winrate:.1f}%</strong>Win rate</div><div><strong>{metrics['net']:+.2f}</strong>Realized P/L</div>
+<div><strong>{pf}</strong>Profit factor</div><div><strong>{metrics['maxdd']:.2f}</strong>Closed-trade max drawdown</div></section>
+<section><h2>Pairs</h2><table><thead><tr><th>Pair</th><th>Trades</th><th>Realized P/L</th></tr></thead><tbody>{rows}</tbody></table></section>
+<section><small>Latest 500 closed account trades queried, filtered by bot tag and 30-day close time. Not an account equity curve. 
+Realized P/L may exclude fees/financing; use broker statements for accounting. All amounts in account currency.</small></section></html>"""
+    htmlfile.write_text(report_html, encoding='utf8')
+
+
+def run_backtest_comparison(api, days):
+    """Consistent data/pairs, fixed vs flip UT, plus the original S/R Bollinger strategy.
+
+    Exactly the same 70/30 calendar-date split for every strategy; no tuning on holdout.
+    """
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+    boundary = pd.Timestamp(start + timedelta(days=days * .7))
+    start_ts = pd.Timestamp(start)
+    results = {"UT+ fixed": [], "UT+ flip": [], "S/R Bollinger": []}
+    for pair in PAIRS:
+        try:
+            sig = fetch_range(api, pair, TIMEFRAME, start - timedelta(days=SIG_WARMUP[TIMEFRAME]))
+            higher = fetch_range(api, pair, HTF, start - timedelta(days=HTF_WARMUP[TIMEFRAME]))
+            daily = higher if HTF == "D" else fetch_range(api, pair, "D", start - timedelta(days=120))
+            if len(sig) < 300 or len(higher) < 250 or len(daily) < 15:
+                log.info(f"COMPARE | {pair} skipped: insufficient candles")
+                continue
+            ut = add_htf_trend(prepare(sig), higher)
+            fixed, _ = simulate(ut, pair, daily, start_ts, True, "fixed")
+            flip, _ = simulate(ut, pair, daily, start_ts, True, "flip")
+            sr, _ = simulate_srbb(prepare_srbb(sig, daily), pair, start_ts)
+            for label, trades in zip(results, (fixed, flip, sr)):
+                # Slippage/swap corrections are applied explicitly: this comparison
+                # calls the wrapped simulator functions, same as other backtests.
+                results[label].extend(trades)
+            log.info(f"COMPARE | {pair} | UT fixed {len(fixed)}, UT flip {len(flip)}, S/R {len(sr)}")
+        except Exception as e:
+            log.error(f"COMPARE | {pair} ERROR | {e}")
+    log.info(f"COMPARE | identical {days}-day window | {TIMEFRAME} | holdout begins {boundary:%Y-%m-%d}")
+    log.info(f"{'strategy':<18}{'set':<10}{'trades':>7}{'win%':>8}{'avgR':>8}{'PF':>8}{'totalR':>10}{'maxDD_R':>9}")
+    for label, trades in results.items():
+        for name, subset in (("all", list(trades)),
+                             ("search", [x for x in trades if pd.Timestamp(x['entry']) < boundary]),
+                             ("holdout", [x for x in trades if pd.Timestamp(x['entry']) >= boundary])):
+            m = stats(subset)
+            log.info(f"{label:<18}{name:<10}{m['n']:>7}{m['win']:>8.1f}{m['avg']:>8.2f}"
+                     f"{m['pf']:>8.2f}{m['total']:>10.1f}{m['dd']:>9.1f}")
+    log.info(COST_NOTE)
+    log.info("COMPARE caution: no position concurrency limits, partial fills, or online walk-forward execution. "
+             "Holdout is not truly untouched if you used these dates to tune strategies before.")
+
 
 
 def news_events():
@@ -3677,7 +4041,7 @@ def news_events():
             except Exception:
                 continue
             events.append((str(e.get("country", "")).upper(), ts, str(e.get("title", ""))))
-        _NEWS.update(t=now, events=events)
+        _NEWS.update(t=now, events=events, ok_t=now)
         log.info(f"news calendar loaded | {len(events)} high-impact events this week")
     except Exception as ex:
         _NEWS["t"] = now - 3 * 3600 + 900   # try again in 15 minutes
@@ -3690,7 +4054,7 @@ def news_block(pair, now):
     if not NEWS_FILTER:
         return None
     events = news_events()
-    if events is None:
+    if events is None or time.time() - _NEWS["ok_t"] > 12 * 3600:   # missing, or not refreshed for 12h (last week's?)
         return "news feed unavailable" if NEWS_FAIL_MODE == "block" else None
     ccys = pair.split("_")
     for ccy, ts, title in events:
@@ -3739,25 +4103,33 @@ def add_exposure(ex, pair, direction):
     ex[quote] = ex.get(quote, 0) - direction
 
 
-def size_units(api, pair, risk_price):
-    """Units so that hitting the stop loses about RISK_PCT% of the balance (falls back to UNITS)."""
+def quote_to_account(pair, account_currency):
+    """Home-currency conversion for a P/L amount denominated in instrument quote currency."""
+    quote = pair.split("_")[1]
+    conv = 1.0 if quote == account_currency else _HOME_CONV.get(quote)
+    if conv is None or not np.isfinite(conv) or conv <= 0:
+        raise RuntimeError(f"missing/invalid {quote}->{account_currency} loss conversion; skip entry")
+    return float(conv)
+
+
+def size_units(api, pair, risk_price, account=None):
+    """Size by NAV and risk. NEVER substitute a fixed-size order if risk sizing fails."""
+    if not np.isfinite(risk_price) or risk_price <= 0:
+        raise RuntimeError("invalid stop distance")
     if RISK_PCT <= 0:
+        if UNITS <= 0 or UNITS > MAX_UNITS:
+            raise RuntimeError("fixed UNITS must be between 1 and MAX_UNITS")
         return UNITS, "fixed"
-    try:
-        acct = api.get(f"/v3/accounts/{api.account}/summary")["account"]
-        balance, ccy = float(acct["balance"]), acct["currency"]
-        quote = pair.split("_")[1]
-        conv = 1.0 if quote == ccy else _HOME_CONV.get(quote)
-        if conv is None:
-            raise RuntimeError(f"no {quote}->{ccy} rate")
-        units = int(balance * RISK_PCT / 100 / (risk_price * conv))
-        return max(0, min(units, MAX_UNITS)), f"{RISK_PCT:g}% risk"
-    except Exception as e:
-        log.info(f"{pair} | sizing fell back to {UNITS} units ({e})")
-        return UNITS, "fixed (fallback)"
+    acct = account if account is not None else api.get(f"/v3/accounts/{api.account}/summary")["account"]
+    nav = float(acct["NAV"])
+    if not np.isfinite(nav) or nav <= 0:
+        raise RuntimeError("invalid account NAV")
+    conv = quote_to_account(pair, acct["currency"])
+    units = int(nav * RISK_PCT / 100 / (risk_price * conv))
+    return max(0, min(units, MAX_UNITS)), f"{RISK_PCT:g}% NAV risk"
 
 
-def place_order(api, pair, direction, sl, tp=None, size=None):
+def place_order(api, pair, direction, sl, tp=None, size=None, signal_id=None):
     size = UNITS if size is None else size
     units = size if direction == 1 else -size
     order = {
@@ -3771,6 +4143,10 @@ def place_order(api, pair, direction, sl, tp=None, size=None):
     }
     if tp is not None:  # flip mode has no target: the bot closes the trade itself when UT flips
         order["takeProfitOnFill"] = {"price": fmt_price(pair, tp), "timeInForce": "GTC"}
+    # A deterministic client ID allows the broker log to be reconciled if the HTTP reply is lost.
+    # It is NOT an account-wide guarantee against two separate Railway replicas racing.
+    if signal_id:
+        order["clientExtensions"] = {"id": signal_id, "tag": MANAGED_TAG}
     body = {"order": order}
     status, j = api.post(f"/v3/accounts/{api.account}/orders", body)
     fill = j.get("orderFillTransaction")
@@ -3803,6 +4179,8 @@ def manage_flip_exits(api, pair, d, trades_by_pair, open_pairs):
         fill = j.get("orderFillTransaction")
         if fill:
             log.info(f"{pair} | FLIP EXIT | closed trade {t['id']} @ {fill.get('price')} | P/L {fill.get('pl')}")
+            send_alert(f"OANDA bot: {pair} FLIP EXIT, trade {t['id']} closed. P/L {fill.get('pl')}")
+            mark_notified_close(t["id"])
             trades_by_pair[pair] = [x for x in trades_by_pair[pair] if x["id"] != t["id"]]
         else:
             log.info(f"{pair} | FLIP EXIT FAILED | trade {t['id']} | HTTP {status} | {str(j)[:200]}")
@@ -3811,7 +4189,8 @@ def manage_flip_exits(api, pair, d, trades_by_pair, open_pairs):
         open_pairs.discard(pair)
 
 
-def process_pair(api, pair, prices, open_pairs, trades_by_pair=None, ex=None):
+def process_pair(api, pair, prices, open_pairs, trades_by_pair=None, ex=None,
+                 account=None, entries_allowed=True, risk_budget=None):
     sig = fetch_recent(api, pair, TIMEFRAME, 500)
     if len(sig) < 200:
         log.info(f"{pair} | NO TRADE | blocked: not enough candles")
@@ -3820,6 +4199,19 @@ def process_pair(api, pair, prices, open_pairs, trades_by_pair=None, ex=None):
     d = add_htf_trend(prepare(sig), htf)
     row = d.iloc[-1]
     now = pd.Timestamp(datetime.now(timezone.utc))
+    bar_s = TF_MIN[TIMEFRAME] * 60
+    for _ in range(3):   # the newest candle can be marked complete a few seconds late: retry instead of skipping it
+        age = (now - row["close_time"]).total_seconds()
+        since_boundary = (now.value // 10**9) % bar_s
+        if age <= STALE_SECONDS or since_boundary > 60:
+            break
+        time.sleep(5)
+        sig = fetch_recent(api, pair, TIMEFRAME, 500)
+        if len(sig) < 200:
+            break
+        d = add_htf_trend(prepare(sig), htf)
+        row = d.iloc[-1]
+        now = pd.Timestamp(datetime.now(timezone.utc))
     if EXIT_MODE == "flip" and trades_by_pair:
         manage_flip_exits(api, pair, d, trades_by_pair, open_pairs)  # runs even on a stale candle, so a missed flip is caught up
     if (now - row["close_time"]).total_seconds() > STALE_SECONDS:
@@ -3834,6 +4226,9 @@ def process_pair(api, pair, prices, open_pairs, trades_by_pair=None, ex=None):
 
     if pair in open_pairs:
         log.info(f"{pair} | {trend} | {side} | blocked: position already open")
+        return
+    if not entries_allowed or account is None or risk_budget is None:
+        log.info(f"{pair} | {trend} | {side} | blocked: risk-entry gate unavailable/triggered")
         return
     safety = ny_block(now) or news_block(pair, now) or (exposure_block(ex, pair, direction) if ex is not None else None)
     if safety:
@@ -3873,53 +4268,141 @@ def process_pair(api, pair, prices, open_pairs, trades_by_pair=None, ex=None):
             f"{pair} | {trend} | {side} | SIGNAL ENTRY {fmt_price(pair, entry)} "
             f"SL {fmt_price(pair, sl)} TP {fmt_price(pair, tp)} | RR 1:{RR:.1f}"
         )
-    units, how = size_units(api, pair, risk)
-    if units < 1:
-        log.info(f"{pair} | {trend} | {side} | SKIPPED: size rounds to 0 units")
+    try:
+        units, how = size_units(api, pair, risk, account)
+        if units < 1:
+            log.info(f"{pair} | {trend} | {side} | SKIPPED: size rounds to 0 units")
+            return
+        proposed = (units * risk * quote_to_account(pair, account["currency"])
+                    if MAX_PORTFOLIO_RISK_PCT > 0 else 0.0)
+        nav = float(account["NAV"])
+        if MAX_PORTFOLIO_RISK_PCT > 0 and (
+            100 * (risk_budget["risk"] + proposed) / nav > MAX_PORTFOLIO_RISK_PCT
+        ):
+            log.info(f"{pair} | {side} | blocked: total risk to stops would exceed {MAX_PORTFOLIO_RISK_PCT:g}% NAV")
+            return
+        signal_id = claim_signal(pair, row["close_time"])
+        if signal_id is None:
+            log.info(f"{pair} | {side} | blocked: this candle's signal was already submitted")
+            return
+        ok, msg = place_order(api, pair, direction, sl, tp, units, signal_id)
+    except Exception as e:
+        # This includes unconfirmed order API errors. Never retry automatically.
+        log.error(f"{pair} | {side} | ORDER/SIZING FAILURE | {type(e).__name__}: {e}")
+        send_alert(f"OANDA bot: {pair} {side} order/sizing failure. Check Railway logs before retrying.")
         return
-    ok, msg = place_order(api, pair, direction, sl, tp, units)
     log.info(f"{pair} | {msg} | {units} units ({how})")
     if ok:
         open_pairs.add(pair)
+        risk_budget["risk"] += proposed
         if ex is not None:
             add_exposure(ex, pair, direction)
+        send_alert(f"OANDA bot: {pair} {side} filled, {units} units. Stop {fmt_price(pair, sl)}" +
+                   (f", target {fmt_price(pair, tp)}" if tp is not None else ", exit on UT flip"))
+    else:
+        send_alert(f"OANDA bot: {pair} {side} order not filled. {msg[:120]}")
+
+
+_CYCLE_COUNT = 0
 
 
 def live_cycle(api):
+    global _CYCLE_COUNT
     trades = api.get(f"/v3/accounts/{api.account}/openTrades").get("trades", [])
     trades_by_pair = {}
     for t in trades:
         trades_by_pair.setdefault(t["instrument"], []).append(t)
     open_pairs = set(trades_by_pair)
     ex = exposure(trades)
-    prices = get_prices(api)
-    log.info(f"--- scan | {len(trades)} open trade(s) | exit {EXIT_MODE} ---")
+    prices = get_prices(api, sorted(set(PAIRS).union(open_pairs)))
+    entries_allowed = False
+    account = None
+    budget = None
+    try:
+        account = api.get(f"/v3/accounts/{api.account}/summary")["account"]
+        # These entry checks run once per cycle, not separately for every pair.
+        entries_allowed, daily_status = daily_entry_gate(account)
+        log.info(f"DAILY GUARD | {daily_status}")
+        open_risk = open_portfolio_risk(trades, prices, account) if MAX_PORTFOLIO_RISK_PCT > 0 else 0.0
+        budget = {"risk": open_risk}
+        nav = float(account["NAV"])
+        log.info(f"PORTFOLIO RISK | {100*open_risk/nav:.2f}% NAV already exposed to stops "
+                 f"| max {MAX_PORTFOLIO_RISK_PCT:g}% (0=off)")
+        if MAX_PORTFOLIO_RISK_PCT > 0 and 100 * open_risk / nav >= MAX_PORTFOLIO_RISK_PCT:
+            entries_allowed = False
+            log.warning("PORTFOLIO LIMIT | new entries blocked; existing exits remain active")
+    except Exception as e:
+        log.error(f"ENTRY RISK GUARD ERROR | {e} | no new entries in this cycle")
+        send_alert(f"OANDA bot: risk guard blocked new entries. Check Railway logs. ({type(e).__name__})")
+    log.info(f"--- scan | {len(trades)} open trade(s) | exit {EXIT_MODE} "
+             f"| new entries {'enabled' if entries_allowed else 'BLOCKED'} ---")
     evaluated = 0
     for pair in PAIRS:
         try:
-            if process_pair(api, pair, prices, open_pairs, trades_by_pair, ex) is not False:
+            if process_pair(api, pair, prices, open_pairs, trades_by_pair, ex,
+                            account, entries_allowed, budget) is not False:
                 evaluated += 1
         except Exception as e:
             log.error(f"{pair} | ERROR | {e}")
     if evaluated == 0:
         log.info(f"no new {TIMEFRAME} candle yet (market closed, or waiting for the next close)")
+    _CYCLE_COUNT += 1
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            notify_recent_closes(api)
+        except Exception as e:
+            log.warning(f"CLOSE NOTIFICATIONS FAILED | {type(e).__name__}")
+    if account is not None and PERFORMANCE_REPORT_EVERY_CYCLES > 0 and (
+        _CYCLE_COUNT % PERFORMANCE_REPORT_EVERY_CYCLES == 0
+    ):
+        try:
+            report_performance(api, account)
+        except Exception as e:
+            log.warning(f"PERFORMANCE REPORT FAILED | {type(e).__name__}: {e}")
 
 
-def seconds_to_next_bar():
-    now = datetime.now(timezone.utc)
-    mins = 15 - (now.minute % 15)
-    nxt = now.replace(second=0, microsecond=0) + timedelta(minutes=mins)
-    return max(1.0, (nxt - now).total_seconds() + 5)
+def seconds_to_next_bar(now=None):
+    """Sleep until the next completed candle for the chosen M15/M30/H1/H4."""
+    now = now or datetime.now(timezone.utc)
+    # OANDA's H4 candles may close at 01/05/09 UTC or 02/06/10 UTC depending
+    # on its New York daily alignment/DST, so poll hourly rather than guess.
+    period = (60 if TIMEFRAME == "H4" else TF_MIN[TIMEFRAME]) * 60
+    timestamp = now.timestamp()
+    nxt_timestamp = (int(timestamp // period) + 1) * period
+    return max(1.0, nxt_timestamp - timestamp + 5)
+
+
+def resolve_mode():
+    """Backtest unless live is asked for explicitly AND confirmed. Anything unexpected stops the bot without trading."""
+    if len(sys.argv) > 1:
+        arg = sys.argv[1].strip().lower()
+        if arg != "backtest":
+            log.error(f"Command-line mode {sys.argv[1]!r} refused: only 'backtest' may be given on the command line "
+                      "(live needs the MODE and LIVE_CONFIRM variables). Bot stopped - nothing was traded.")
+            sys.exit(1)
+        return "backtest"
+    raw = os.getenv("MODE", "backtest")
+    mode = raw.strip().lower() or "backtest"
+    if mode not in ("backtest", "live"):
+        log.error(f"MODE must be 'backtest' or 'live', got {raw!r}. Bot stopped - nothing was traded.")
+        sys.exit(1)
+    if mode == "live" and os.getenv("LIVE_CONFIRM", "").strip().lower() != "yes":
+        log.error("MODE is 'live' but LIVE_CONFIRM is not 'yes'. Bot stopped - nothing was traded.")
+        sys.exit(1)
+    return mode
 
 
 def main():
-    mode = (sys.argv[1] if len(sys.argv) > 1 else os.getenv("MODE", "live")).lower()
+    mode = resolve_mode()
     api = Oanda()
     if mode == "backtest":
         days = int(sys.argv[2]) if len(sys.argv) > 2 else _i("BACKTEST_DAYS", 90)
         strategy = os.getenv("BACKTEST_STRATEGY", "ut").strip().lower()
         log.info(f"BACKTEST_STRATEGY read as '{strategy}' (TIMEFRAME {TIMEFRAME}, BACKTEST_DAYS {days})")
-        if strategy == "srbb":
+        log.info(COST_NOTE)
+        if strategy == "compare":
+            run_backtest_comparison(api, days)
+        elif strategy == "srbb":
             run_backtest_srbb(api, days)
         elif strategy == "flux":
             run_backtest_flux(api, days)
@@ -3961,10 +4444,13 @@ def main():
             run_backtest(api, days)
         else:
             log.error(f"Unknown BACKTEST_STRATEGY '{strategy}'. Check the spelling in Railway. Options include: ut, srbb, "
-                      "flux, po3s, po3c, po3e, lbo, po3x, smc, smce, combo, po3v2, po3w, tsm, scan, sax, xgb, po3tools, brk, news")
+                      "compare, flux, po3s, po3c, po3e, lbo, po3x, smc, smce, combo, po3v2, po3w, tsm, scan, sax, xgb, po3tools, brk, news")
         while True:  # idle so Railway does not keep re-running it
             time.sleep(3600)
 
+    # Local process lock prevents duplicate workers sharing a Railway volume/state file.
+    # Set Railway replicas to 1: independent replicas without a shared volume can still race.
+    _single_instance_lock()
     stop_txt = f"{SL_ATR_MULT:g}xATR" if STOP_MODE == "atr" else "UT trail"
     exit_txt = f"fixed (RR 1:{RR:g})" if EXIT_MODE == "fixed" else "flip"
     log.info(
@@ -3978,12 +4464,17 @@ def main():
     )
     while True:
         wait = seconds_to_next_bar()
-        log.info(f"Waiting {wait:.0f}s for the next 15-minute mark...")
+        log.info(f"Waiting {wait:.0f}s for the next {TIMEFRAME} candle close...")
         time.sleep(wait)
         try:
             live_cycle(api)
         except Exception as e:
             log.error(f"CYCLE ERROR | {e}")
+
+
+# every simulator's trades pay the swap estimate (SWAP_PIPS_PER_NIGHT, 0 turns it off)
+for _name in ['simulate', 'simulate_srbb', 'simulate_po3', 'simulate_ob', 'simulate_po3_session', 'simulate_po3_combo', 'simulate_po3_echo', 'simulate_po3x', 'simulate_smc', 'simulate_combo', 'simulate_po3_echo_conf', 'simulate_tsm', 'scan_simulate', 'sax_simulate', 'simulate_xgb', 'simulate_po3_tools', 'simulate_breakout']:
+    globals()[_name] = _with_swap(globals()[_name])
 
 
 if __name__ == "__main__":
