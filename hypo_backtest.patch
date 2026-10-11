@@ -1,0 +1,832 @@
+From bbf2af93fa9d791d689f0f56326882a87733d24c Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Mon, 12 Oct 2026 07:02:39 +0800
+Subject: [PATCH] Add fixed-rule candle-only CSM and shock backtests with
+ offline tests
+
+---
+ hypo_test.py | 522 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ test_hypo.py | 282 ++++++++++++++++++++++++++++
+ 2 files changed, 804 insertions(+)
+ create mode 100644 hypo_test.py
+ create mode 100644 test_hypo.py
+
+diff --git a/hypo_test.py b/hypo_test.py
+new file mode 100644
+index 0000000..56efd80
+--- /dev/null
++++ b/hypo_test.py
+@@ -0,0 +1,522 @@
++"""Fixed-rule, candle-only hypothesis backtests. Run HYPO=csm|shock python hypo_test.py.
++
++Optional HYPO_END is an ISO-8601 exclusive endpoint (date-only = midnight UTC).
++Default endpoint is startup UTC time; it is printed for reproducibility. No tuning
++parameters are exposed. Credentials: OANDA_API_KEY (also usual token aliases),
++OANDA_ENV=practice|live. Only public instrument-candle GETs are implemented; no
++bot import, account ID, or trading interface is needed. Railway restart policy
++should be Never: this is a one-shot job, exiting after the report.
++
++Conventions fixed before results: sample SD (ddof=1); Wilder ATR seeded with the
++mean of 20 true ranges (first TR is high-low); daily candle's trading date is
++its New York close date. Split by elapsed UTC time, not trade count, and close
++positions at each period's last completed M15 close. Each leg has one constant
++initial cash-risk unit, so monthly R is the sum, not the average, of leg R.
++R uses fixed entry-time quote conversion (no subsequent FX translation).
++Intrabar timestamps are candle starts, explicitly approximate; rollover and
++holding estimates therefore have at most a candle of timing uncertainty.
++Spread cost is attribution, NOT another deduction: entry half-spread plus exit
++half-spread (OHLC component at fill, open spread as proxy for intrabar fills).
++Stress fixes accepted baseline entry IDs, direction, risk and scheduled exit;
++levels are re-anchored at stressed entry prices, exits are re-simulated. Old
++ordering also fixes baseline entries, isolating the exit-engine difference.
++"""
++from __future__ import annotations
++
++from bisect import bisect_right
++from collections import defaultdict
++from dataclasses import dataclass, replace
++from datetime import datetime, timedelta, timezone, time as walltime
++import gc
++import json
++import math
++import os
++import statistics
++import time
++from zoneinfo import ZoneInfo
++
++UTC = timezone.utc
++NY = ZoneInfo('America/New_York')
++CSM_PAIRS = ('EUR_USD', 'GBP_USD', 'AUD_USD', 'NZD_USD',
++             'USD_JPY', 'USD_CAD', 'USD_CHF')
++SHOCK_PAIRS = ('EUR_USD', 'GBP_USD', 'USD_JPY')
++
++
++def stamp(value):
++    if isinstance(value, datetime):
++        result = value
++    else:
++        result = datetime.fromisoformat(value.replace('Z', '+00:00'))
++    return result.replace(tzinfo=UTC) if result.tzinfo is None else result.astimezone(UTC)
++
++
++def iso(value):
++    return value.astimezone(UTC).isoformat().replace('+00:00', 'Z')
++
++
++def pip_size(pair):
++    return 0.01 if pair.endswith('_JPY') else 0.0001
++
++
++def close_time(start, gran):
++    if gran == 'D':
++        local = start.astimezone(NY)
++        return datetime.combine(local.date() + timedelta(days=1), walltime(17), NY).astimezone(UTC)
++    return start + timedelta(minutes={'H1': 60, 'M15': 15}[gran])
++
++
++@dataclass(frozen=True)
++class Candle:
++    t: datetime
++    end: datetime
++    mid: tuple  # o,h,l,c
++    bid: tuple
++    ask: tuple
++
++    def widened(self):
++        return replace(self,
++                       bid=tuple(m + 2 * (b - m) for m, b in zip(self.mid, self.bid)),
++                       ask=tuple(m + 2 * (a - m) for m, a in zip(self.mid, self.ask)))
++
++
++def truncate(candles, end):
++    return (c for c in candles if c.end <= end and c.t < end)
++
++
++class CandleClient:
++    """Intentionally exposes ONLY a fixed instrument candle endpoint."""
++    def __init__(self):
++        import requests
++        token = next((os.getenv(k) for k in ('OANDA_API_KEY', 'OANDA_API_TOKEN',
++                     'OANDA_TOKEN', 'OANDA_ACCESS_TOKEN') if os.getenv(k)), None)
++        if not token:
++            raise RuntimeError('Set OANDA_API_KEY to a candle-data API token')
++        env = os.getenv('OANDA_ENV', 'practice').lower()
++        if env not in ('practice', 'live'):
++            raise ValueError('OANDA_ENV must be practice or live')
++        self.base = 'https://api-fxpractice.oanda.com' if env == 'practice' else 'https://api-fxtrade.oanda.com'
++        self.session = requests.Session()
++        self.session.headers['Authorization'] = 'Bearer ' + token.strip()
++
++    def page(self, pair, gran, **params):
++        if pair not in CSM_PAIRS or gran not in ('D', 'H1', 'M15'):
++            raise ValueError('Unsupported candle request')
++        params.update(granularity=gran, price='MBA', smooth='false',
++                      dailyAlignment=17, alignmentTimezone='America/New_York')
++        for attempt in range(5):
++            response = self.session.get(self.base + '/v3/instruments/' + pair + '/candles',
++                                        params=params, timeout=60)
++            if response.status_code in (429, 500, 502, 503, 504):
++                time.sleep(2 ** attempt)
++                continue
++            response.raise_for_status()
++            raw = response.json()['candles']
++            result = []
++            for row in raw:
++                if row.get('complete'):
++                    t = stamp(row['time'])
++                    values = [tuple(float(row[k][x]) for x in 'ohlc') for k in ('mid', 'bid', 'ask')]
++                    if any(not math.isfinite(v) for group in values for v in group):
++                        raise ValueError('Nonfinite candle data')
++                    result.append(Candle(t, close_time(t, gran), *values))
++            return sorted(result, key=lambda c: c.t)
++        raise RuntimeError('Candle API retry limit reached')
++
++    def history(self, pair, gran, end):
++        """Backward paging discovers history without an arbitrary start date."""
++        cursor, rows = end, []
++        while True:
++            page = self.page(pair, gran, to=iso(cursor), count=5000)
++            page = [c for c in page if c.t < cursor and c.end <= end]
++            if not page:
++                break
++            rows.extend(page)
++            cursor = page[0].t
++            print(f'Download {pair} {gran}: {len(rows)} candles, back to {iso(cursor)}', flush=True)
++        unique = {c.t: c for c in rows}
++        return sorted(unique.values(), key=lambda c: c.t)
++
++    def stream(self, pair, start, end):
++        """Forward M15 pages, at most 5,000 candles resident; end clipped first."""
++        cursor = start
++        while cursor < end:
++            page = self.page(pair, 'M15', **{'from': iso(cursor), 'count': 5000})
++            page = [c for c in page if c.t >= cursor]
++            if not page:
++                return
++            for c in truncate(page, end):
++                yield c
++            if page[-1].end >= end:
++                return
++            next_cursor = page[-1].t + timedelta(seconds=1)
++            if next_cursor <= cursor:
++                raise RuntimeError('Candle pagination made no progress')
++            cursor = next_cursor
++
++    def first_m15(self, start, end, pair):
++        rows = self.page(pair, 'M15', **{'from': iso(start), 'count': 1})
++        if not rows or rows[0].end > end:
++            raise RuntimeError(f'No M15 history for {pair}')
++        return rows[0].t
++
++
++def wilder(candles, n=20):
++    result, seed, previous, atr = [], [], None, None
++    for c in candles:
++        _, high, low, closing = c.mid
++        tr = high - low if previous is None else max(high-low, abs(high-previous), abs(low-previous))
++        previous = closing
++        if atr is None:
++            seed.append(tr)
++            if len(seed) == n:
++                atr = statistics.fmean(seed)
++        else:
++            atr = ((n-1)*atr + tr)/n
++        result.append(atr)
++    return result
++
++
++def rollovers(entry, exit_):
++    """17:00 NY boundaries in (entry, exit], calendar nights including weekends."""
++    if exit_ < entry:
++        raise ValueError('Exit precedes entry')
++    def bucket(t):
++        local = t.astimezone(NY)
++        return local.date().toordinal() - (local.time() < walltime(17))
++    return bucket(exit_) - bucket(entry)
++
++
++def currency_direction(pair, buy_currency):
++    direction = 1 if buy_currency else -1
++    return -direction if pair.startswith('USD_') else direction
++
++
++@dataclass(frozen=True)
++class Plan:
++    pair: str
++    when: datetime
++    direction: int
++    risk: float
++    rr: float
++    expiry: datetime | None = None
++    bars: int | None = None
++    month: str | None = None
++
++
++def csm_plans(history, start, end, session_dates=None):
++    atrs = {p: wilder(rows) for p, rows in history.items()}
++    ends = {p: [c.end for c in rows] for p, rows in history.items()}
++    # The session close date identifies Monday's Sunday-17:00 daily candle.
++    dates = sorted(session_dates if session_dates is not None else
++                   {c.end.astimezone(NY).date() for rows in history.values() for c in rows})
++    first = {}
++    for date in dates:
++        if date.weekday() < 5:
++            first.setdefault((date.year, date.month), date)
++    schedule = [datetime.combine(d, walltime(9), NY).astimezone(UTC) for d in first.values()]
++    schedule.sort()
++    plans = []
++    for j, when in enumerate(schedule):
++        if not start <= when < end:
++            continue
++        expiry = schedule[j+1] if j+1 < len(schedule) else end
++        scores, risks = {}, {}
++        for pair, rows in history.items():
++            i = bisect_right(ends[pair], when)-1
++            if i < 63 or atrs[pair][i] is None:
++                break
++            returns = [math.log(rows[k].mid[3]/rows[k-1].mid[3]) for k in range(i-62, i+1)]
++            sd = statistics.stdev(returns)
++            if sd <= 0 or atrs[pair][i] <= 0:
++                break
++            scores[pair] = sum(returns)/sd * (-1 if pair.startswith('USD_') else 1)
++            risks[pair] = 2*atrs[pair][i]
++        if len(scores) != len(history):
++            continue
++        strongest = max(sorted(scores), key=scores.get)
++        weakest = min(sorted(scores), key=scores.get)
++        if scores[strongest] > 0 and scores[weakest] < 0:
++            for pair, buy in ((strongest, True), (weakest, False)):
++                plans.append(Plan(pair, when, currency_direction(pair, buy), risks[pair], 3,
++                                  expiry=expiry, month=when.astimezone(NY).strftime('%Y-%m')))
++    return plans
++
++
++def shock_plans(pair, candles, start, end):
++    atrs = wilder(candles)
++    plans = []
++    for i, c in enumerate(candles):
++        if i == 0 or atrs[i-1] is None or not start <= c.end < end:
++            continue
++        local = c.end.astimezone(NY).time()
++        if not walltime(8) <= local <= walltime(12):
++            continue
++        o, h, l, closing = c.mid
++        risk = atrs[i-1]
++        if h <= l or risk <= 0 or abs(closing-o) <= 1.5*risk:
++            continue
++        direction = 1 if closing > o else -1
++        if (direction == 1 and closing >= h-0.2*(h-l)) or (direction == -1 and closing <= l+0.2*(h-l)):
++            plans.append(Plan(pair, c.end, direction, risk, 2, bars=16))
++    return plans
++
++
++class Position:
++    def __init__(self, plan, candle, variant):
++        self.plan, self.variant = plan, variant
++        c = candle.widened() if variant == 'stress' else candle
++        self.entry = c.ask[0] if plan.direction == 1 else c.bid[0]
++        self.entry_time = c.t
++        self.stop = self.entry-plan.direction*plan.risk
++        self.target = self.entry+plan.direction*plan.risk*plan.rr
++        self.entry_half_spread = (c.ask[0]-c.bid[0])/2
++        self.held = 0
++        self.result = None
++
++    def finish(self, candle, price, reason, timestamp, approximate=False, ambiguous=False, component=0):
++        p = self.plan
++        nights = rollovers(self.entry_time, timestamp)
++        slip = (0.4 if self.variant == 'stress' else 0.2)*pip_size(p.pair)
++        swap = nights*0.5*pip_size(p.pair)
++        spread = self.entry_half_spread + (candle.ask[component]-candle.bid[component])/2
++        self.result = dict(pair=p.pair, entry=iso(self.entry_time), exit=iso(timestamp),
++                           direction=p.direction, risk=p.risk, entry_price=self.entry, exit_price=price,
++                           r=(p.direction*(price-self.entry)-slip-swap)/p.risk,
++                           cost_r=(spread+slip+swap)/p.risk, spread_r=spread/p.risk,
++                           slippage_r=slip/p.risk, swap_r=swap/p.risk, nights=nights,
++                           holding_hours=(timestamp-self.entry_time).total_seconds()/3600,
++                           reason=reason, approximate=approximate, ambiguous=int(ambiguous),
++                           end_forced=reason == 'end', month=p.month, variant=self.variant)
++        return self.result
++
++    def step(self, raw):
++        if self.result is not None:
++            return self.result
++        c = raw.widened() if self.variant == 'stress' else raw
++        p = self.plan
++        o, h, l, closing = c.bid if p.direction == 1 else c.ask
++        # Monthly scheduled liquidation precedes any new monthly entry.
++        if p.expiry is not None and c.t >= p.expiry:
++            return self.finish(c, o, 'month', c.t)
++        self.held += 1
++        stop_open = o <= self.stop if p.direction == 1 else o >= self.stop
++        target_open = o >= self.target if p.direction == 1 else o <= self.target
++        stop_hit = l <= self.stop if p.direction == 1 else h >= self.stop
++        target_hit = h >= self.target if p.direction == 1 else l <= self.target
++        if self.variant != 'old':
++            if stop_open:
++                return self.finish(c, o, 'stop_gap', c.t)
++            if target_open:
++                return self.finish(c, self.target, 'target_gap', c.t)
++        if stop_hit:
++            # Legacy ordering still applied adverse stop gaps, but checked the
++            # whole candle's stop before an already-executable target at open.
++            price = o if stop_open else self.stop
++            return self.finish(c, price, 'stop', c.t, not stop_open, target_hit)
++        if target_hit:
++            return self.finish(c, self.target, 'target', c.t, True)
++        if p.bars is not None and self.held >= p.bars:
++            return self.finish(c, closing, 'time', c.end, component=3)
++        return None
++
++    def force_end(self, raw):
++        c = raw.widened() if self.variant == 'stress' else raw
++        px = c.bid[3] if self.plan.direction == 1 else c.ask[3]
++        return self.finish(c, px, 'end', c.end, component=3)
++
++
++def simulate(candles, plans, start, end, strategy):
++    """Single pass; baseline eligibility freezes the trade set for all variants."""
++    plans = sorted((p for p in plans if start <= p.when < end), key=lambda p: p.when)
++    records = {v: [] for v in ('base', 'old', 'stress')}
++    active, used_dates, skips, cursor, last = [], set(), 0, 0, None
++    for c in truncate(candles, end):
++        if c.t < start:
++            continue
++        last = c
++        # At a monthly boundary, liquidate first, even in a no-trade month.
++        for pos in active[:]:
++            if pos.plan.expiry is not None and c.t >= pos.plan.expiry:
++                records[pos.variant].append(pos.step(c))
++                active.remove(pos)
++        due = []
++        while cursor < len(plans) and plans[cursor].when <= c.t:
++            due.append(plans[cursor])
++            cursor += 1
++        for p in due:
++            if p.expiry is not None and c.t >= p.expiry:
++                continue
++            date = c.t.astimezone(NY).date()
++            if any(pos.variant == 'base' for pos in active):
++                continue
++            if strategy == 'shock' and date in used_dates:
++                continue
++            if c.ask[0]-c.bid[0] > 0.05*p.risk + 1e-12:
++                skips += 1
++                continue
++            used_dates.add(date)
++            active.extend(Position(p, c, v) for v in records)
++        for pos in active[:]:
++            result = pos.step(c)
++            if result is not None:
++                records[pos.variant].append(result)
++                active.remove(pos)
++    if last is not None:
++        for pos in active:
++            records[pos.variant].append(pos.force_end(last))
++    for values in records.values():
++        values.sort(key=lambda r: (r['entry'], r['pair']))
++    return records, skips
++
++
++def metrics(values):
++    values = list(values)
++    positive = sum(x for x in values if x > 0)
++    negative = -sum(x for x in values if x < 0)
++    equity = peak = dd = 0.0
++    for x in values:
++        equity += x
++        peak = max(peak, equity)
++        dd = max(dd, peak-equity)
++    return dict(trades=len(values), win_rate=sum(x > 0 for x in values)/len(values) if values else 0,
++                avgR=statistics.fmean(values) if values else 0,
++                PF=positive/negative if negative else ('infinity' if positive else None), max_drawdown_R=dd)
++
++
++def summarize(rows, strategy, skips):
++    # Aggregate simultaneous closes to avoid a spurious arbitrary pair ordering.
++    exits = defaultdict(float)
++    for r in rows:
++        exits[r['exit']] += r['r']
++    report = metrics(r['r'] for r in rows)
++    report['max_drawdown_R'] = metrics(exits[t] for t in sorted(exits))['max_drawdown_R']
++    report.update(average_holding_hours=statistics.fmean(r['holding_hours'] for r in rows) if rows else 0,
++                  average_cost_R=statistics.fmean(r['cost_r'] for r in rows) if rows else 0,
++                  ambiguous_candles=sum(r['ambiguous'] for r in rows), spread_filter_skips=skips,
++                  end_forced=sum(r['end_forced'] for r in rows),
++                  approximate_exits=sum(r['approximate'] for r in rows))
++    report['per_pair'] = {p: dict(metrics(r['r'] for r in rows if r['pair'] == p),
++                                  total_R=sum(r['r'] for r in rows if r['pair'] == p))
++                          for p in (CSM_PAIRS if strategy == 'csm' else SHOCK_PAIRS)}
++    if strategy == 'csm':
++        months = defaultdict(float)
++        for r in rows:
++            months[r['month']] += r['r']
++        report['monthly'] = metrics(months[m] for m in sorted(months))
++        report['monthly']['months_traded'] = report['monthly'].pop('trades')
++        report['monthly_R'] = dict(sorted(months.items()))
++    return report
++
++
++def changed_count(base, old):
++    def key(r):
++        return r['pair'], r['entry']
++    other = {key(r): r for r in old}
++    return sum(r['exit'] != other[key(r)]['exit'] or
++               not math.isclose(r['exit_price'], other[key(r)]['exit_price'], abs_tol=1e-12) or
++               not math.isclose(r['r'], other[key(r)]['r'], abs_tol=1e-12)
++               for r in base)
++
++
++def emit(tag, value):
++    print(tag + ' ' + json.dumps(value, allow_nan=False, sort_keys=True), flush=True)
++
++
++def main():
++    strategy = os.getenv('HYPO', '').lower().strip()
++    if strategy not in ('csm', 'shock'):
++        raise ValueError('Set HYPO=csm or HYPO=shock')
++    end = stamp(os.environ['HYPO_END']) if os.getenv('HYPO_END') else datetime.now(UTC)
++    if end > datetime.now(UTC):
++        raise ValueError('HYPO_END cannot be in the future')
++    api = CandleClient()
++    pairs = CSM_PAIRS if strategy == 'csm' else SHOCK_PAIRS
++    gran = 'D' if strategy == 'csm' else 'H1'
++    histories, starts = {}, []
++    # H1 discovery retains just one pair at a time, then reloads that pair for
++    # simulation. Daily history for all seven pairs is small and is retained.
++    for pair in pairs:
++        rows = api.history(pair, gran, end)
++        warm = 63 if strategy == 'csm' else 19
++        if len(rows) <= warm:
++            raise RuntimeError(f'Insufficient {gran} history for {pair}')
++        first = api.first_m15(rows[0].t, end, pair)
++        starts.append(max(rows[warm].end, first))
++        if strategy == 'csm':
++            histories[pair] = rows
++        del rows
++        gc.collect()
++    start = max(starts)
++    split = start + (end-start)*2/3
++    periods = [('evaluation', start, split), ('holdout', split, end)]
++    emit('WINDOWS', dict(strategy=strategy, start=iso(start), split=iso(split), end=iso(end),
++                         holdout_label='previously inspected (related trend-following tests)' if strategy == 'csm' else 'holdout'))
++    print('Fixed rules. No parameter search. Equal initial risk units; realized-close drawdown. '
++          'Intrabar times/costs approximate. Periods flat at boundaries. Stress and old ordering use baseline entries.', flush=True)
++    if strategy == 'csm':
++        print('The two legs are correlated; months are the independent sample. '
++              'Monthly statistics include months with >=1 accepted leg; portfolio R=sum(leg R).', flush=True)
++    all_rows = {name: {v: [] for v in ('base', 'old', 'stress')} for name, _, _ in periods}
++    skips = defaultdict(int)
++    for pair in pairs:
++        rows = histories if strategy == 'csm' else api.history(pair, gran, end)
++        for name, a, b in periods:
++            if strategy == 'csm':
++                # Truncate daily data at THIS period endpoint before planning.
++                clipped = {p: list(truncate(ds, b)) for p, ds in rows.items()}
++                # Session-calendar metadata uses only session opens before the
++                # cutoff; no incomplete daily OHLC enters rankings or ATR.
++                dates = {c.end.astimezone(NY).date() for ds in rows.values() for c in ds if c.t < b}
++                plans = [p for p in csm_plans(clipped, a, b, dates) if p.pair == pair]
++                del clipped
++                # Fetch only selected monthly holding windows for this pair.
++                def selected_candles():
++                    for plan in plans:
++                        # Include the first available expiry open, even after a
++                        # long data gap. Adjacent holding windows are deduped.
++                        for candle in api.stream(pair, plan.when, b):
++                            yield candle
++                            if candle.t >= plan.expiry:
++                                break
++                def unique_candles():
++                    previous = None
++                    for candle in selected_candles():
++                        if previous is None or candle.t > previous:
++                            previous = candle.t
++                            yield candle
++                candles = unique_candles()
++            else:
++                plans = shock_plans(pair, list(truncate(rows, b)), a, b)
++                candles = api.stream(pair, a, b)
++            results, skipped = simulate(candles, plans, a, b, strategy)
++            skips[name] += skipped
++            for variant, trades in results.items():
++                all_rows[name][variant].extend(trades)
++            print(f'Finished {pair} {name}: {len(results["base"])} accepted legs, {skipped} spread skips', flush=True)
++        del rows, plans, results, candles
++        gc.collect()
++    pooled = {v: all_rows['evaluation'][v]+all_rows['holdout'][v] for v in ('base', 'old', 'stress')}
++    reports = {}
++    for name, variants in list(all_rows.items()) + [('pooled', pooled)]:
++        skip = sum(skips.values()) if name == 'pooled' else skips[name]
++        reports[name] = {}
++        for variant, trades in variants.items():
++            reports[name][variant] = summarize(trades, strategy, skip)
++            emit(f'REPORT {name} {variant}', reports[name][variant])
++        emit(f'ORDERING_CHANGE {name}', dict(changed_trades=changed_count(variants['base'], variants['old']),
++                                             compared_trades=len(variants['base'])))
++    # Leg-level audit trail is printed once (pooled), including stress and legacy.
++    for variant, trades in pooled.items():
++        for r in sorted(trades, key=lambda r: (r['entry'], r['pair'])):
++            emit('TRADE', r)
++    for variant in ('base', 'stress'):
++        p = reports['pooled'][variant]
++        pf_ok = p['PF'] == 'infinity' or (isinstance(p['PF'], (float, int)) and p['PF'] >= 1.2)
++        passed = (reports['evaluation'][variant]['avgR'] > 0 and reports['holdout'][variant]['avgR'] > 0
++                  and pf_ok and p['trades'] >= 300)
++        emit('PASS_BAR', dict(strategy=strategy, variant=variant, result='PASS' if passed else 'FAIL',
++                              closed_trades=p['trades'], months=p.get('monthly', {}).get('months_traded')))
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/test_hypo.py b/test_hypo.py
+new file mode 100644
+index 0000000..1fe322e
+--- /dev/null
++++ b/test_hypo.py
+@@ -0,0 +1,282 @@
++"""Synthetic, offline regression tests: python -m unittest -v test_hypo.py."""
++import ast
++import contextlib
++import io
++import json
++from dataclasses import replace
++from datetime import datetime, timedelta
++import math
++from pathlib import Path
++import unittest
++from unittest.mock import patch
++
++import hypo_test as h
++
++
++def candle(t='2024-01-08T14:00:00Z', o=100, high=100.2, low=99.8, c=100, spread=0):
++    t = h.stamp(t)
++    mid = (o, high, low, c)
++    return h.Candle(t, t+timedelta(minutes=15), mid,
++                    tuple(x-spread/2 for x in mid), tuple(x+spread/2 for x in mid))
++
++
++def plan(c, direction=1, **kwargs):
++    return h.Plan('EUR_USD', c.t, direction, 1, 2, **kwargs)
++
++
++class ExitTests(unittest.TestCase):
++    def test_target_gap_precedes_intrabar_stop_both_directions(self):
++        for d in (1, -1):
++            entry = candle()
++            pos = h.Position(plan(entry, d), entry, 'base')
++            gap = candle(entry.end, o=100+3*d, high=104, low=96)
++            result = pos.step(gap)
++            self.assertEqual(result['reason'], 'target_gap')
++            self.assertEqual(result['exit_price'], 100+2*d)
++            self.assertFalse(result['approximate'])
++            self.assertEqual(result['ambiguous'], 0)
++            old = h.Position(plan(entry, d), entry, 'old').step(gap)
++            self.assertEqual(old['reason'], 'stop')
++            self.assertEqual(old['ambiguous'], 1)
++            self.assertEqual(h.changed_count([result], [old]), 1)
++
++    def test_stop_gap_both_directions(self):
++        for d in (1, -1):
++            entry = candle()
++            gap = candle(entry.end, o=100-2*d, high=103, low=97)
++            result = h.Position(plan(entry, d), entry, 'base').step(gap)
++            self.assertEqual(result['reason'], 'stop_gap')
++            self.assertEqual(result['exit_price'], 100-2*d)
++            self.assertFalse(result['approximate'])
++
++    def test_both_touched_is_stop_and_approximate(self):
++        c = candle(high=103, low=98)
++        r = h.Position(plan(c), c, 'base').step(c)
++        self.assertEqual(r['reason'], 'stop')
++        self.assertEqual(r['ambiguous'], 1)
++        self.assertTrue(r['approximate'])
++        self.assertEqual(r['exit'], h.iso(c.t))
++
++    def test_sixteenth_candle_close_timestamp(self):
++        c = candle()
++        candles = [replace(c, t=c.t+timedelta(minutes=15*i), end=c.end+timedelta(minutes=15*i)) for i in range(20)]
++        rows, _ = h.simulate(candles, [plan(c, bars=16)], c.t, candles[-1].end, 'shock')
++        r = rows['base'][0]
++        self.assertEqual(r['reason'], 'time')
++        self.assertEqual(r['exit'], h.iso(candles[15].end))
++        self.assertEqual(r['holding_hours'], 4)
++        self.assertFalse(r['approximate'])
++
++    def test_truncate_before_simulation(self):
++        c = candle()
++        future = candle(c.end, high=500, low=0)
++        end = c.end + timedelta(minutes=5)
++        records, _ = h.simulate([c, future], [plan(c)], c.t, end, 'shock')
++        r = records['base'][0]
++        self.assertEqual(r['reason'], 'end')
++        self.assertTrue(r['end_forced'])
++        self.assertEqual(r['exit'], h.iso(c.end))
++        self.assertEqual(r['exit_price'], 100)
++        self.assertEqual(list(h.truncate([c, future], end)), [c])
++
++    def test_spread_not_double_counted_and_costs_once(self):
++        c = candle(spread=.02)
++        for d in (1, -1):
++            r = h.Position(plan(c, d), c, 'base').force_end(c)
++            self.assertAlmostEqual(r['r'], -.02002)
++            self.assertAlmostEqual(r['cost_r'], .02002)
++            self.assertAlmostEqual(r['slippage_r'], .00002)
++
++    def test_stress_uses_actual_filter_same_entries(self):
++        c = candle(spread=.04)
++        rows, skips = h.simulate([c], [plan(c)], c.t, c.end, 'shock')
++        self.assertEqual(skips, 0)
++        self.assertEqual([len(v) for v in rows.values()], [1, 1, 1])
++        self.assertAlmostEqual(rows['stress'][0]['cost_r'], .08004)
++        rejected = candle(spread=.06)
++        rows, skips = h.simulate([rejected], [plan(rejected)], rejected.t, rejected.end, 'shock')
++        self.assertEqual(skips, 1)
++        self.assertTrue(all(not v for v in rows.values()))
++
++    def test_monthly_exit_at_open_before_new_entry(self):
++        c = candle()
++        nxt = candle(c.t+timedelta(days=30), o=100.1)
++        p = plan(c, expiry=nxt.t, month='2024-01')
++        p2 = plan(nxt, month='2024-02')
++        rows, _ = h.simulate([c, nxt], [p, p2], c.t, nxt.end, 'csm')
++        self.assertEqual(len(rows['base']), 2)
++        self.assertEqual(rows['base'][0]['reason'], 'month')
++        self.assertEqual(rows['base'][0]['exit'], rows['base'][1]['entry'])
++        self.assertEqual(rows['base'][0]['exit_price'], nxt.bid[0])
++
++    def test_rollover_dst_and_calendar_weekends(self):
++        # Friday after rollover to Monday after rollover = Sat/Sun/Mon: 3.
++        for a, b in [('2024-03-08T23:00:00Z', '2024-03-11T22:00:00Z'),
++                     ('2024-11-01T22:00:00Z', '2024-11-04T23:00:00Z')]:
++            self.assertEqual(h.rollovers(h.stamp(a), h.stamp(b)), 3)
++        for before, at in [('2024-07-01T20:59:59Z', '2024-07-01T21:00:00Z'),
++                           ('2024-01-01T21:59:59Z', '2024-01-01T22:00:00Z')]:
++            self.assertEqual(h.rollovers(h.stamp(before), h.stamp(at)), 1)
++            self.assertEqual(h.rollovers(h.stamp(at), h.stamp(at)), 0)
++
++    def test_one_entry_per_ny_date_not_utc_date(self):
++        first = candle('2024-01-08T23:45:00Z')
++        same_ny = candle('2024-01-09T00:15:00Z')
++        next_ny = candle('2024-01-09T05:00:00Z')
++        candles = [first, same_ny, next_ny]
++        rows, _ = h.simulate(candles, [plan(c, bars=1) for c in candles], first.t, next_ny.end, 'shock')
++        self.assertEqual([r['entry'] for r in rows['base']], [h.iso(first.t), h.iso(next_ny.t)])
++
++    def test_only_one_open_position(self):
++        first = candle()
++        second = candle(first.end)
++        rows, _ = h.simulate([first, second], [plan(first, bars=16), plan(second, bars=16)], first.t, second.end, 'shock')
++        self.assertEqual(len(rows['base']), 1)
++
++
++class SignalTests(unittest.TestCase):
++    def test_usd_base_flip(self):
++        self.assertEqual(h.currency_direction('USD_JPY', True), -1)
++        self.assertEqual(h.currency_direction('USD_CHF', False), 1)
++        self.assertEqual(h.currency_direction('EUR_USD', True), 1)
++        self.assertEqual(h.currency_direction('GBP_USD', False), -1)
++
++    def test_csm_63_returns_ranking_and_no_lookahead(self):
++        dates = []
++        d = h.stamp('2023-09-01T21:00:00Z')
++        while d < h.stamp('2024-02-03T00:00:00Z'):
++            if d.astimezone(h.NY).weekday() < 5:
++                dates.append(d)
++            d += timedelta(days=1)
++        history = {}
++        for pair in h.CSM_PAIRS:
++            # USD_JPY rising means JPY is weakest; EUR is strongest.
++            rate = .004 if pair in ('EUR_USD', 'USD_JPY') else .0001
++            price, rows = 100., []
++            for i, end in enumerate(dates):
++                price *= math.exp(rate + (.0002 if i % 2 else -.0002))
++                c = candle(end-timedelta(days=1), o=price, high=price+1, low=price-1, c=price)
++                rows.append(replace(c, end=end))
++            history[pair] = rows
++        start = h.stamp('2024-01-01T00:00:00Z')
++        end = h.stamp('2024-02-02T00:00:00Z')
++        plans = h.csm_plans(history, start, end)
++        january = [p for p in plans if p.month == '2024-01']
++        self.assertEqual({p.pair for p in january}, {'EUR_USD', 'USD_JPY'})
++        self.assertTrue(all(p.direction == 1 for p in january))
++        self.assertEqual(january[0].when, h.stamp('2024-01-01T14:00:00Z'))
++        # Alter only data unavailable at the January entry.
++        changed = {p: [replace(c, mid=(1., 900., .01, 500.)) if c.end > january[0].when else c
++                       for c in rows] for p, rows in history.items()}
++        again = [p for p in h.csm_plans(changed, start, end) if p.month == '2024-01']
++        self.assertEqual(january, again)
++
++    def test_wilder_seed_and_recursion(self):
++        candles = [candle(high=101, low=99) for _ in range(20)]
++        candles.append(candle(high=103, low=97))
++        atr = h.wilder(candles)
++        self.assertTrue(all(x is None for x in atr[:19]))
++        self.assertEqual(atr[19], 2)
++        self.assertAlmostEqual(atr[20], 2.2)
++
++    def test_shock_uses_prior_atr_and_close_session(self):
++        start = h.stamp('2024-01-08T12:00:00Z')  # closes 08:00 NY
++        warm = [replace(candle(start-timedelta(hours=20-i), high=100.5, low=99.5),
++                        end=start-timedelta(hours=19-i)) for i in range(20)]
++        sig = replace(candle(start, o=100, high=102, low=100, c=102), end=start+timedelta(hours=1))
++        rows = warm+[sig]
++        plans = h.shock_plans('EUR_USD', rows, start, sig.end+timedelta(hours=1))
++        self.assertEqual(len(plans), 1)
++        self.assertEqual(plans[0].risk, 1)
++        self.assertEqual(plans[0].when, sig.end)
++        self.assertEqual(plans[0].direction, 1)
++        late = replace(sig, t=h.stamp('2024-01-08T17:00:00Z'), end=h.stamp('2024-01-08T18:00:00Z'))
++        self.assertEqual(h.shock_plans('EUR_USD', warm+[late], start, late.end+timedelta(hours=1)), [])
++
++    def test_daily_close_alignment(self):
++        for start, expected in [('2024-03-10T21:00:00Z', '2024-03-11T21:00:00Z'),
++                                ('2024-11-03T22:00:00Z', '2024-11-04T22:00:00Z')]:
++            self.assertEqual(h.close_time(h.stamp(start), 'D'), h.stamp(expected))
++
++    def test_report_month_sum_and_drawdown(self):
++        c = candle()
++        r = h.Position(plan(c, month='2024-01'), c, 'base').force_end(c)
++        rows = [dict(r, r=2), dict(r, r=-1), dict(r, r=-2, month='2024-02', exit='2024-02-01T00:00:00Z')]
++        report = h.summarize(rows, 'csm', 5)
++        self.assertEqual(report['monthly_R'], {'2024-01': 1, '2024-02': -2})
++        self.assertEqual(report['monthly']['months_traded'], 2)
++        self.assertEqual(report['monthly']['max_drawdown_R'], 2)
++        self.assertEqual(report['spread_filter_skips'], 5)
++
++
++class SafetyTests(unittest.TestCase):
++    def test_no_bot_import_or_trading_endpoints(self):
++        source = Path(h.__file__).read_text()
++        tree = ast.parse(source)
++        for node in ast.walk(tree):
++            if isinstance(node, ast.ImportFrom) and node.module == 'bot':
++                self.assertLessEqual({x.name for x in node.names}, {'Oanda', 'fetch_range', 'pip'})
++            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
++                self.assertNotIn(node.func.attr, ('post', 'put', 'delete', 'patch'))
++        self.assertNotIn('/v3/accounts', source)
++
++    def test_offline_main_both_strategies(self):
++        class FakeClient:
++            def history(self, pair, gran, end):
++                rows, price = [], 100.
++                start = h.stamp('2023-01-01T00:00:00Z')
++                step = timedelta(days=1) if gran == 'D' else timedelta(hours=1)
++                t, i = start, 0
++                while t + step <= end:
++                    i += 1
++                    drift = .2 if pair == 'EUR_USD' else -.2
++                    closing = price + drift * (1 if i % 2 else 1.1)
++                    c = candle(t, o=price, high=max(price, closing)+.1,
++                               low=min(price, closing)-.1, c=closing, spread=.0001)
++                    rows.append(replace(c, end=t+step))
++                    price, t = closing, t+step
++                return rows
++            def first_m15(self, start, end, pair):
++                return start
++            def stream(self, pair, start, end):
++                # Sparse fixture exercises delayed entries and period truncation.
++                t = start
++                while t + timedelta(minutes=15) <= end:
++                    yield candle(t, spread=.0001)
++                    t += timedelta(days=1)
++        for strategy in ('csm', 'shock'):
++            output = io.StringIO()
++            with patch.object(h, 'CandleClient', FakeClient), patch.dict('os.environ',
++                    {'HYPO': strategy, 'HYPO_END': '2023-07-01T00:00:00Z'}), contextlib.redirect_stdout(output):
++                h.main()
++            text = output.getvalue()
++            self.assertIn('REPORT evaluation base ', text)
++            self.assertIn('REPORT holdout stress ', text)
++            self.assertIn('REPORT pooled old ', text)
++            self.assertEqual(text.count('PASS_BAR '), 2)
++            if strategy == 'csm':
++                self.assertIn('previously inspected (related trend-following tests)', text)
++                self.assertIn('TRADE ', text)
++
++    def test_client_url_allowlist_and_stream_end(self):
++        class Response:
++            status_code = 200
++            def raise_for_status(self):
++                pass
++            def json(self):
++                return {'candles': []}
++        with patch.dict('os.environ', {'OANDA_API_KEY': 'synthetic', 'OANDA_ENV': 'practice'}):
++            client = h.CandleClient()
++        with patch.object(client.session, 'get', return_value=Response()) as get:
++            client.page('EUR_USD', 'D', count=1)
++            self.assertEqual(get.call_args.args[0], 'https://api-fxpractice.oanda.com/v3/instruments/EUR_USD/candles')
++            with self.assertRaises(ValueError):
++                client.page('../accounts', 'D', count=1)
++        c = candle()
++        future = candle(c.end, high=500)
++        with patch.object(client, 'page', return_value=[c, future]):
++            self.assertEqual(list(client.stream('EUR_USD', c.t, c.end)), [c])
++
++
++if __name__ == '__main__':
++    unittest.main()
+-- 
+2.51.1
+
