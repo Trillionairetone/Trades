@@ -629,6 +629,144 @@ def probe(cfg: Config, k: KalshiClient) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------
+# Order test (demo only): proves the trading plumbing end to end
+# --------------------------------------------------------------------------
+def ordertest(cfg: Config, k: KalshiClient) -> int:
+    """
+    1. resting post-only order far from the market -> confirm it rests -> cancel it
+    2. buy 1 contract at the ask (NO side if available, to test the conversion)
+    3. confirm position + fill, wait for settlement, reconcile cash to the cent
+    Places at most ONE filled contract. Refuses to run on prod.
+    """
+    checks: Dict[str, bool] = {}
+
+    def check(name: str, ok: bool, detail: str = "") -> None:
+        checks[name] = ok
+        print(f"   [{'PASS' if ok else 'FAIL'}] {name} {detail}")
+
+    print(f"== ORDER TEST | env={k.env}")
+    if k.env != "demo":
+        print("refusing: order test only runs on KALSHI_ENV=demo")
+        return 0
+    series = env("ORDERTEST_SERIES", "KXBTC15M")
+    bal0 = k.get_balance()
+    print(f"cash ${bal0}")
+    if bal0 < 5:
+        print("demo balance under $5 - add mock funds at demo.kalshi.co first")
+        return 0
+
+    # find an open market with at least 4 minutes left
+    market, ob = None, None
+    for _ in range(12):
+        now = time.time()
+        live = [m for m in k.iter_markets(series_ticker=series, min_close_ts=int(now))
+                if is_open(m) and (market_close_ts(m) or 0) - now >= 240]
+        if live:
+            market = min(live, key=market_close_ts)
+            ob = k.get_orderbook(market["ticker"])
+            if ob.yes_ask is not None or ob.no_ask is not None:
+                break
+        print("   waiting for an open market with asks ...")
+        time.sleep(15)
+        market = None
+    if not market:
+        print("no tradeable market found - try again in a few minutes")
+        return 0
+    ticker = market["ticker"]
+    close = market_close_ts(market)
+    print(f"market {ticker} | closes in {(close - time.time()) / 60:.1f} min | "
+          f"YES {ob.best_yes_bid}/{ob.yes_ask}  NO {ob.best_no_bid}/{ob.no_ask}")
+    if k.get_positions(ticker=ticker):
+        print("already holding this market (earlier run?) - not adding another order")
+        return 0
+
+    # 1) resting order + cancel
+    print("\n1) resting order + cancel")
+    try:
+        r = k.create_order(ticker, "bid", 1, D("0.01"), time_in_force="good_till_canceled",
+                           post_only=True)
+        oid = r.get("order_id", "")
+        check("order accepted", bool(oid), f"id={oid}")
+        time.sleep(1.5)
+        resting = [o for o in k.get_orders(ticker=ticker, status="resting")
+                   if o.get("order_id") == oid]
+        check("order is resting on the book", bool(resting))
+        k.cancel_order(oid, ticker)
+        time.sleep(1.5)
+        still = [o for o in k.get_orders(ticker=ticker, status="resting")
+                 if o.get("order_id") == oid]
+        check("cancel removed it", not still)
+    except KalshiError as e:
+        check("resting order round-trip", False, str(e))
+
+    # 2) one real fill
+    print("\n2) buy 1 contract at the ask")
+    side = "no" if ob.no_ask is not None else "yes"
+    ask = ob.ask(side)
+    try:
+        fn = k.buy_no if side == "no" else k.buy_yes
+        r = fn(ticker, 1, ask, time_in_force="immediate_or_cancel")
+        print("   raw response:", json.dumps({kk: r.get(kk) for kk in
+              ("order_id", "fill_count", "remaining_count", "average_fill_price",
+               "average_fee_paid", "recovered")}))
+        filled = D(r.get("fill_count") or "0")
+        check(f"filled 1 {side.upper()} at <= {ask}", filled >= 1, f"fill_count={filled}")
+    except KalshiError as e:
+        check("fill", False, str(e))
+        filled = ZERO
+    if filled < 1:
+        print("no fill (thin demo book?) - run again next window")
+        return 0
+    yes_avg = r.get("average_fill_price")
+    paid = (D(yes_avg) if side == "yes" else ONE - D(yes_avg)) if yes_avg else ask
+    fee = D(r.get("average_fee_paid") or "0") or fee_estimate(1, paid)
+    print(f"   paid {paid} + fee {fee} for 1 {side.upper()}")
+    time.sleep(2)
+    pos = k.get_positions(ticker=ticker)
+    pfp = D(pos[0].get("position_fp", "0")) if pos else ZERO
+    # Kalshi reports YES as positive, NO as negative
+    check("position shows on the account",
+          bool(pos) and ((pfp > 0) if side == "yes" else (pfp < 0)), f"position_fp={pfp}")
+    fills = k.get_fills(ticker=ticker, max_items=5)
+    check("fill appears in fill history", bool(fills))
+    if fills:
+        print("   fill record:", json.dumps({kk: fills[0].get(kk) for kk in list(fills[0])[:12]}))
+    bal1 = k.get_balance()
+    check("cash dropped by cost + fee", abs((bal0 - bal1) - (paid + fee)) <= D("0.011"),
+          f"{bal0} -> {bal1}")
+
+    # 3) settlement
+    print(f"\n3) waiting for settlement (~{(close - time.time()) / 60:.0f} min) ...")
+    result = None
+    deadline = close + 1800
+    while time.time() < deadline:
+        time.sleep(30)
+        if time.time() < close:
+            continue
+        try:
+            result = result_of(k.get_market(ticker))
+        except KalshiError:
+            continue
+        if result:
+            break
+    if not result:
+        check("market settled within 30 min of close", False)
+    else:
+        won = result == side
+        time.sleep(20)  # let the cash credit post
+        bal2 = k.get_balance()
+        expected = bal1 + (ONE if won else ZERO)
+        print(f"   result: {result.upper()} -> you {'WON' if won else 'LOST'}")
+        check("settled cash matches expectation", abs(bal2 - expected) <= D("0.011"),
+              f"expected {expected}, got {bal2}")
+        print(f"   net on the test: {bal2 - bal0:+}")
+
+    ok = all(checks.values())
+    print(f"\nORDER TEST: {'ALL PASS - trading plumbing verified' if ok else 'SOME CHECKS FAILED'}")
+    return 0
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -639,6 +777,14 @@ def main() -> int:
     k = KalshiClient()
     if cfg.mode == "probe":
         return probe(cfg, k)
+    if cfg.mode == "ordertest":
+        try:
+            return ordertest(cfg, k)
+        except Exception:
+            # exit 0 on purpose: a crash would make Railway restart us and
+            # place the test order again
+            log.exception("order test aborted")
+            return 0
     if cfg.mode == "live" and k.env == "prod" and cfg.prod_confirm != "YES_REAL_MONEY":
         log.error("refusing live trading on PROD without LIVE_PROD_CONFIRM=YES_REAL_MONEY")
         return 2
