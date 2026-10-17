@@ -300,13 +300,16 @@ class KalshiClient:
     MAX_RETRIES = 5
 
     def __init__(self, env: Optional[str] = None, signer: Optional[Signer] = None,
-                 session: Optional[requests.Session] = None, timeout: float = 10.0):
+                 session: Optional[requests.Session] = None, timeout: float = 10.0,
+                 public: bool = False):
+        """public=True: no signing, for public market-data endpoints only."""
         self.env = (env or os.getenv("KALSHI_ENV", "demo")).lower().strip()
         if self.env not in BASE_URLS:
             raise ValueError(f"KALSHI_ENV must be demo or prod, got {self.env!r}")
         self.base = BASE_URLS[self.env]
         self.base_path = urlparse(self.base).path  # "/trade-api/v2"
-        self.signer = signer or Signer.from_env()
+        self.public = public
+        self.signer = None if public else (signer or Signer.from_env())
         self.http = session or requests.Session()
         self.timeout = timeout
         read_rate = float(os.getenv("KALSHI_READ_RATE", "200"))
@@ -342,7 +345,7 @@ class KalshiClient:
         auth_retried = False
         for attempt in range(self.MAX_RETRIES + 1):
             bucket.acquire(cost)
-            headers = self.signer.headers(method, sign_path)
+            headers = self.signer.headers(method, sign_path) if self.signer else {}
             headers["Content-Type"] = "application/json"
             try:
                 resp = self.http.request(method, url, headers=headers, json=body,

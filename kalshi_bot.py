@@ -633,6 +633,9 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = Config()
+    if cfg.mode == "backtest":
+        import kalshi_backtest
+        return kalshi_backtest.run()
     k = KalshiClient()
     if cfg.mode == "probe":
         return probe(cfg, k)
