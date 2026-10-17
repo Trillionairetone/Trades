@@ -403,6 +403,9 @@ class Bot:
             st.paper_cash = str(D(st.paper_cash) - cost)
             cash_after = st.paper_cash
         else:
+            shard = int(market.get("exchange_index") or 0)
+            need = contracts * cap + fee_estimate(contracts, cap, cfg.taker_fee_coef) + 1
+            self.k.ensure_shard_cash(shard, need, top_up_to=max(need, cfg.stake_dollars * 3))
             fn = self.k.buy_yes if dec["side"] == "yes" else self.k.buy_no
             resp = fn(ticker, contracts, cap, time_in_force="immediate_or_cancel")
             order_id = resp.get("order_id", "")
@@ -680,6 +683,19 @@ def ordertest(cfg: Config, k: KalshiClient) -> int:
     if k.get_positions(ticker=ticker):
         print("already holding this market (earlier run?) - not adding another order")
         return 0
+
+    # 0) collateral must sit on the market's own shard
+    shard = int(market.get("exchange_index") or 0)
+    print(f"\n0) shard collateral | market lives on shard {shard}")
+    print("   balances by shard:", {s: str(v) for s, v in k.shard_balances().items()})
+    try:
+        have = k.ensure_shard_cash(shard, needed=5, top_up_to=50)
+        check(f"shard {shard} funded", have >= 5, f"${have}")
+    except KalshiError as e:
+        check(f"shard {shard} funded", False, str(e))
+        print("   could not move cash between shards; see log above")
+        return 0
+    bal0 = k.get_balance()
 
     # 1) resting order + cancel
     print("\n1) resting order + cancel")
