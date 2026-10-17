@@ -790,6 +790,9 @@ def main() -> int:
     if cfg.mode == "backtest":
         import kalshi_backtest
         return kalshi_backtest.run()
+    if cfg.mode == "forward":
+        import kalshi_forward   # paper only: unauthenticated client, cannot place orders
+        return kalshi_forward.run()
     k = KalshiClient()
     if cfg.mode == "probe":
         return probe(cfg, k)
