@@ -10,10 +10,22 @@ row of the po3w wide test). Do not change them during the forward test.
   - Enter at market on the next candle's open; stop 5 x ATR(50); target 0.86R; hold until stop or target
   - One position per pair; no new signal while the simulated trade for that pair would still be open
 
+Execution fixes (2026-10-15; strategy rules unchanged)
+  - Read requests that fail with HTTP 401, 429, any 5xx (500-599) or a network error are retried after
+    1, 2 and 4 minutes (4 attempts per request); every retry is logged. Delays can add up across the
+    several requests of one check. Orders are never retried.
+  - Stale-signal guard: an order is sent only if, at the moment of sending, it is within 15 minutes of
+    the H4 candle's close; it is checked before the order is prepared and again just before submission.
+  - Order preparation: slow account and history requests first, then a fresh price quote, then the
+    stop/target calculation and the final freshness check, so the order never uses an old quote.
+  - Duplicate guard: before an order, the pair's recent trades (open or closed) are checked for a trade
+    with the same signal ID.
+
 Safety
   - Practice only: refuses to start unless OANDA_ENV is practice (or unset) and H4_LIVE_CONFIRM=yes
-  - Every order carries a stop loss and take profit, and a unique client ID per pair + candle, so OANDA
-    itself rejects a duplicate if the bot restarts
+  - Every order carries a stop loss and take profit, and a unique client ID per pair + candle. OANDA only
+    rejects a repeated client ID while the first order is still pending, so restarts rely on the
+    duplicate guard above (a check-then-order step; it does not stop two runners racing each other)
   - Orders are never retried automatically
   - Each trade's 1R distance is stored on the trade itself (OANDA client comment), so results in R
     survive restarts without needing a Railway Volume
@@ -48,6 +60,17 @@ SL_ATR, RR = 5.0, 0.86
 ECHO_LEN = ECHO_FCAST = 50
 HISTORY = 1000                                 # H4 candles fetched each check (~8 months of warm-up)
 TAG = "h4po3e"
+RETRY_DELAYS = (60, 120, 240)                  # seconds before attempts 2, 3 and 4 of a read request
+RETRY_STATUSES = (401, 429)                    # plus every 5xx (500-599), see retryable()
+STALE_MINUTES = 15                             # max minutes after an H4 close to act on its signal
+
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+
+def retryable(status):
+    return status in RETRY_STATUSES or 500 <= status <= 599
 
 
 def _f(name, default):
@@ -85,22 +108,28 @@ class Oanda:
         self.s = requests.Session()
         self.s.headers.update({"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
 
+    retries = 0                                       # retries since start (shown in the PERFORMANCE line)
+
     def get(self, path, params=None):
+        """Read request: up to 4 attempts; waits 1, 2 and 4 minutes after a retryable failure."""
         last = None
-        for attempt in range(4):
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            if attempt:
+                Oanda.retries += 1
+                log.warning(f"RETRY | GET {path} | {last} | attempt {attempt + 1} of {len(RETRY_DELAYS) + 1} "
+                            f"after {RETRY_DELAYS[attempt - 1]}s")
+                time.sleep(RETRY_DELAYS[attempt - 1])
             try:
                 r = self.s.get(self.base + path, params=params, timeout=30)
-                if r.status_code == 200:
-                    return r.json()
-                if r.status_code in (429, 500, 502, 503, 504):
-                    last = f"HTTP {r.status_code}"
-                    time.sleep(2 ** attempt)
-                    continue
-                raise RuntimeError(f"GET {path} -> {r.status_code}: {r.text[:300]}")
             except requests.RequestException as e:
-                last = str(e)
-                time.sleep(2 ** attempt)
-        raise RuntimeError(f"GET {path} failed after retries: {last}")
+                last = f"network error ({type(e).__name__})"
+                continue
+            if r.status_code == 200:
+                return r.json()
+            last = f"HTTP {r.status_code}"
+            if not retryable(r.status_code):
+                raise RuntimeError(f"GET {path} -> {r.status_code}: {r.text[:300]}")
+        raise RuntimeError(f"GET {path} failed after {len(RETRY_DELAYS) + 1} attempts: {last}")
 
     def post(self, path, body):
         r = self.s.post(self.base + path, json=body, timeout=30)   # never retried
@@ -244,8 +273,29 @@ def quote_and_conv(api, pair):
     return bid, ask, conv
 
 
+def already_traded(api, pair, cid):
+    """Duplicate guard: OANDA only rejects a repeated client order ID while the first order is still
+    pending, so check recent trades (open or closed) on this pair for the same signal ID."""
+    data = api.get(f"/v3/accounts/{api.account}/trades", {"instrument": pair, "state": "ALL", "count": 50})
+    return any(t.get("clientExtensions", {}).get("id") == cid for t in data.get("trades", []))
+
+
+def fresh_enough(bar_time):
+    """Minutes since the H4 candle closed, and whether that is within STALE_MINUTES."""
+    late = (utcnow() - (bar_time.to_pydatetime() + timedelta(hours=4))).total_seconds() / 60
+    return late, late <= STALE_MINUTES
+
+
 def place(api, pair, direction, atr, bar_time):
-    q = quote_and_conv(api, pair)
+    """Order preparation in a fixed order: duplicate check and account value (slow, may retry), then a
+    fresh quote, then stop/target from that quote, then a final freshness check, then one order."""
+    side = "BUY" if direction == 1 else "SELL"
+    cid = f"{TAG}-{pair}-{bar_time:%Y%m%d%H}"
+    if already_traded(api, pair, cid):
+        log.info(f"{pair} | signal skipped: a trade for this signal already exists (id {cid})")
+        return
+    nav = account_nav(api) if RISK_PCT > 0 else None
+    q = quote_and_conv(api, pair)                     # fresh quote, fetched after the slow requests
     if q is None:
         log.info(f"{pair} | signal skipped: not tradeable right now")
         return
@@ -258,14 +308,18 @@ def place(api, pair, direction, atr, bar_time):
         if not conv:
             log.error(f"{pair} | signal skipped: no currency conversion rate from OANDA")
             return
-        units = int(account_nav(api) * RISK_PCT / 100 / (risk * conv))
+        units = int(nav * RISK_PCT / 100 / (risk * conv))
     else:
         units = UNITS
     units = min(units, MAX_UNITS)
     if units < 1:
         log.info(f"{pair} | signal skipped: size rounds to 0 units")
         return
-    cid = f"{TAG}-{pair}-{bar_time:%Y%m%d%H}"
+    late, ok = fresh_enough(bar_time)                 # final check, immediately before submission
+    if not ok:
+        log.warning(f"{pair} | {side} signal on H4 {bar_time:%m-%d %H:%M} | SKIPPED at submission: stale, "
+                    f"{late:.0f} min after the candle closed (limit {STALE_MINUTES})")
+        return
     body = {"order": {
         "type": "MARKET", "instrument": pair, "units": str(units * direction),
         "timeInForce": "FOK", "positionFill": "DEFAULT",
@@ -274,7 +328,6 @@ def place(api, pair, direction, atr, bar_time):
         "clientExtensions": {"id": cid, "tag": TAG},
         "tradeClientExtensions": {"id": cid, "tag": TAG, "comment": f"risk={risk:.6f}"},
     }}
-    side = "BUY" if direction == 1 else "SELL"
     status, resp = api.post(f"/v3/accounts/{api.account}/orders", body)
     fill = resp.get("orderFillTransaction")
     if status == 201 and fill:
@@ -301,13 +354,14 @@ def performance(api):
         except (KeyError, ValueError, ZeroDivisionError):
             continue
     if not rs:
-        log.info("PERFORMANCE | no closed trades yet")
+        log.info(f"PERFORMANCE | no closed trades yet | request retries since start {Oanda.retries}")
         return
     r = np.array(rs)
     gains, losses = r[r > 0].sum(), -r[r < 0].sum()
     pf = gains / losses if losses > 0 else float("inf")
     log.info(f"PERFORMANCE | {len(r)} closed | win {np.mean(r > 0) * 100:.0f}% | avgR {r.mean():+.3f} | "
-             f"PF {pf:.2f} | total {r.sum():+.2f}R | backtest expected about +0.04R, PF 1.10")
+             f"PF {pf:.2f} | total {r.sum():+.2f}R | backtest expected about +0.04R, PF 1.10 | "
+             f"request retries since start {Oanda.retries}")
 
 
 def check(api, last_seen):
@@ -322,7 +376,7 @@ def check(api, last_seen):
             if last_seen.get(pair) == bar_time:
                 continue                       # this H4 candle was already checked
             last_seen[pair] = bar_time
-            if datetime.now(timezone.utc) - bar_time.to_pydatetime() > timedelta(hours=8):
+            if utcnow() - bar_time.to_pydatetime() > timedelta(hours=8):
                 continue                       # market closed / stale data
             direction, atr = scan_last_bar(d)
             if direction == 0:
@@ -331,6 +385,11 @@ def check(api, last_seen):
             side = "BUY" if direction == 1 else "SELL"
             if pair in open_pairs:
                 log.info(f"{pair} | {side} signal | skipped: position already open")
+                continue
+            late, ok = fresh_enough(bar_time)
+            if not ok:
+                log.warning(f"{pair} | {side} signal on H4 {bar_time:%m-%d %H:%M} | SKIPPED: stale, checked "
+                            f"{late:.0f} min after the candle closed (limit {STALE_MINUTES})")
                 continue
             place(api, pair, direction, atr, bar_time)
         except Exception as e:
@@ -351,7 +410,7 @@ def main():
         try:
             check(api, last_seen)
             checks += 1
-            if checks % 6 == 1:                # about once a day
+            if checks % 6 == 1:                # every 6 successful checks (about every 6 hours)
                 performance(api)
         except Exception as e:
             log.error(f"CHECK ERROR | {e}")
