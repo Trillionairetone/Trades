@@ -109,6 +109,39 @@ class KalshiError(Exception):
 # --------------------------------------------------------------------------
 # Signing
 # --------------------------------------------------------------------------
+def normalize_pem(text: str) -> bytes:
+    """
+    Rebuild a PEM private key that was mangled by copy/paste, e.g. on iPhone:
+    line breaks collapsed into spaces, literal "\\n", wrapping quotes,
+    "smart" dashes (— –) instead of -----, or BEGIN/END lines missing.
+    Never logs key material.
+    """
+    import re
+    t = text.replace("\\n", "\n").strip().strip('"').strip("'")
+    for ch in ("\u2014", "\u2013", "\u2012", "\u2212"):   # em/en/figure dash, minus
+        t = t.replace(ch, "-")
+    m = re.search(r"BEGIN ([A-Z ]*?PRIVATE KEY)-*(.*?)-*END \1", t, re.S)
+    if m:
+        label, body = m.group(1).strip(), m.group(2)
+    else:  # no header/footer: assume the bare base64 body of Kalshi's key
+        label, body = "", re.sub(r"-+[A-Z ]*-+", "", t)
+    body = re.sub(r"[^A-Za-z0-9+/=]", "", body)
+    if len(body) < 100:
+        raise ValueError("KALSHI_PRIVATE_KEY looks empty or truncated "
+                         f"({len(body)} base64 characters found)")
+    lines = "\n".join(body[i:i + 64] for i in range(0, len(body), 64))
+    labels = [label] if label else ["RSA PRIVATE KEY", "PRIVATE KEY"]
+    for lb in labels:
+        pem = f"-----BEGIN {lb}-----\n{lines}\n-----END {lb}-----\n".encode()
+        try:
+            serialization.load_pem_private_key(pem, password=None)
+            return pem
+        except ValueError:
+            continue
+    raise ValueError("KALSHI_PRIVATE_KEY could not be parsed even after cleanup "
+                     f"({len(body)} base64 characters). Re-copy it from the .key file.")
+
+
 class Signer:
     """Loads the private key once and signs request pre-sign strings."""
 
@@ -127,7 +160,7 @@ class Signer:
         b64 = os.getenv("KALSHI_PRIVATE_KEY_B64", "")
         path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "")
         if pem_text:
-            pem = pem_text.replace("\\n", "\n").strip().encode()
+            pem = normalize_pem(pem_text)
         elif b64:
             pem = base64.b64decode(b64)
         elif path:
