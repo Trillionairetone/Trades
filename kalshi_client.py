@@ -447,6 +447,67 @@ class KalshiClient:
             return D(data["balance_dollars"])
         return D(data.get("balance", 0)) / 100
 
+    def shard_balances(self) -> Dict[int, Decimal]:
+        """
+        Cash per exchange shard. Kalshi pins each market to one shard and checks
+        collateral on that shard only, so total cash can be fine while the
+        crypto shard has $0 ("insufficient_shard_balance").
+        """
+        data = self.request("GET", "/portfolio/balance")
+        out: Dict[int, Decimal] = {}
+        bd = data.get("balance_breakdown") or []
+        if isinstance(bd, dict):
+            bd = [{"exchange_index": k2, **(v if isinstance(v, dict) else {"balance_dollars": v})}
+                  for k2, v in bd.items()]
+        for row in bd:
+            if not isinstance(row, dict):
+                continue
+            idx = row.get("exchange_index", row.get("exchange_shard", row.get("index", 0)))
+            if row.get("balance_dollars") is not None:
+                val = D(row["balance_dollars"])
+            else:
+                val = D(row.get("balance", 0)) / 100
+            try:
+                out[int(idx)] = val
+            except (TypeError, ValueError):
+                continue
+        if not out:  # no breakdown reported: everything is on the default shard
+            out[0] = (D(data["balance_dollars"]) if data.get("balance_dollars") is not None
+                      else D(data.get("balance", 0)) / 100)
+        return out
+
+    def transfer_between_shards(self, amount_dollars: Any, source_shard: int,
+                                destination_shard: int) -> Dict[str, Any]:
+        """Instant transfer of cash between shards of the same account."""
+        centicents = int((D(amount_dollars) * 10000).to_integral_value())
+        return self.request("POST", "/portfolio/intra_exchange_instance_transfer", body={
+            "source": "event_contract", "destination": "event_contract",
+            "amount": centicents, "source_exchange_shard": int(source_shard),
+            "destination_exchange_shard": int(destination_shard)})
+
+    def ensure_shard_cash(self, shard: int, needed: Any, top_up_to: Any = None) -> Decimal:
+        """
+        Make sure `shard` holds at least `needed` dollars, moving cash from the
+        richest other shard if not. Returns the shard's balance afterwards.
+        """
+        bals = self.shard_balances()
+        have = bals.get(shard, ZERO)
+        if have >= D(needed):
+            return have
+        target = D(top_up_to if top_up_to is not None else needed)
+        donors = sorted(((v, k2) for k2, v in bals.items() if k2 != shard), reverse=True)
+        if not donors or donors[0][0] <= 0:
+            raise KalshiError(400, f"no cash on other shards to move to shard {shard}")
+        amount = min(target - have, donors[0][0])
+        log.info("moving $%s from shard %s to shard %s", amount, donors[0][1], shard)
+        self.transfer_between_shards(amount, donors[0][1], shard)
+        for _ in range(10):  # processed asynchronously; usually instant
+            time.sleep(1.0)
+            have = self.shard_balances().get(shard, ZERO)
+            if have >= D(needed):
+                break
+        return have
+
     def get_positions(self, ticker: Optional[str] = None,
                       settlement_status: str = "unsettled") -> List[Dict[str, Any]]:
         params = {"ticker": ticker, "settlement_status": settlement_status,
