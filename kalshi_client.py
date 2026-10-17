@@ -126,7 +126,8 @@ def normalize_pem(text: str) -> bytes:
     else:  # no header/footer: assume the bare base64 body of Kalshi's key
         label, body = "", re.sub(r"-+[A-Z ]*-+", "", t)
     body = re.sub(r"[^A-Za-z0-9+/=]", "", body)
-    if len(body) < 100:
+    # Ed25519 keys are short (64 base64 chars); RSA-2048 keys are ~1600.
+    if len(body) < 60:
         raise ValueError("KALSHI_PRIVATE_KEY looks empty or truncated "
                          f"({len(body)} base64 characters found)")
     lines = "\n".join(body[i:i + 64] for i in range(0, len(body), 64))
